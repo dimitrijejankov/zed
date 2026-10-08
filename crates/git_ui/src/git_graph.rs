@@ -8,7 +8,6 @@ use crate::{
     commit_view::CommitView,
     git_status_icon,
 };
-use anyhow::Context as _;
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
@@ -585,8 +584,6 @@ actions!(
     [
         /// Opens the Git Graph Tab.
         Open,
-        /// Opens the Smartlog, showing only draft commits that are not on the trunk branch.
-        OpenSmartlog,
         /// Focuses the search field.
         FocusSearch,
         /// Focuses the next git graph tab stop.
@@ -1135,12 +1132,6 @@ pub fn init(cx: &mut App) {
                                 .ok();
                         }
                     })
-                    .on_action({
-                        let workspace = workspace.clone();
-                        move |_: &OpenSmartlog, window, cx| {
-                            open_smartlog(workspace.clone(), window, cx);
-                        }
-                    })
                     .on_action(move |action: &OpenAtCommit, window, cx| {
                         let sha = action.sha.clone();
                         workspace
@@ -1260,41 +1251,6 @@ pub fn open_or_reuse_graph(
             });
         });
     }
-}
-
-fn open_smartlog(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
-    let Some(repository) = workspace
-        .read_with(cx, |workspace, cx| {
-            workspace.project().read(cx).active_repository(cx)
-        })
-        .ok()
-        .flatten()
-    else {
-        return;
-    };
-    let trunk_receiver = repository.update(cx, |repository, _| repository.default_branch(true));
-    let repo_id = repository.read(cx).id;
-
-    window
-        .spawn(cx, async move |cx| {
-            let trunk = trunk_receiver
-                .await
-                .context("default branch request was canceled")??
-                .context("could not determine the trunk branch for this repository")?;
-            workspace.update_in(cx, |workspace, window, cx| {
-                let git_store = workspace.project().read(cx).git_store().clone();
-                open_or_reuse_graph(
-                    workspace,
-                    repo_id,
-                    git_store,
-                    LogSource::Draft(trunk),
-                    None,
-                    window,
-                    cx,
-                );
-            })
-        })
-        .detach_and_log_err(cx);
 }
 
 fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
@@ -4805,15 +4761,11 @@ impl Item for GitGraph {
             _ => None,
         };
 
-        let is_smartlog = matches!(self.log_source, LogSource::Draft(_));
-
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
             move |_, _| {
                 v_flex()
                     .child(Label::new(if path_history_path.is_some() {
                         "Path History"
-                    } else if is_smartlog {
-                        "Smartlog"
                     } else {
                         "Git Graph"
                     }))
@@ -4835,10 +4787,6 @@ impl Item for GitGraph {
                 .file_name()
                 .map(|name| SharedString::from(name.to_string()))
                 .unwrap_or_else(|| SharedString::from(path.as_unix_str().to_string()));
-        }
-
-        if matches!(self.log_source, LogSource::Draft(_)) {
-            return "Smartlog".into();
         }
 
         self.get_repository(cx)

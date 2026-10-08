@@ -2425,6 +2425,16 @@ impl GitRepository for RealGitRepository {
                     return anyhow::Ok(());
                 }
 
+                let commit_spec = format!("{name}^{{commit}}");
+                if git_binary
+                    .run(&["rev-parse", "--verify", "--quiet", &commit_spec])
+                    .await
+                    .is_ok()
+                {
+                    git_binary.run(&["checkout", "--detach", &name]).await?;
+                    return anyhow::Ok(());
+                }
+
                 anyhow::bail!("Branch '{}' not found", name);
             })
             .boxed()
