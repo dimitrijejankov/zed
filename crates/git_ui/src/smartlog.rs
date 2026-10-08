@@ -1,13 +1,13 @@
 use anyhow::Context as _;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
+use editor::Editor;
 use git::{
     Oid,
-    repository::{CommitOptions, InitialGraphCommitData, LogOrder, LogSource},
-    status::StageStatus,
+    repository::{CommitOptions, InitialGraphCommitData, LogOrder, LogSource, ResetMode},
 };
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    Pixels, SharedString, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    Pixels, PromptLevel, SharedString, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use project::git_store::{
     CommitDataState, GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
@@ -24,7 +24,7 @@ use workspace::{
     notifications::DetachAndPromptErr as _,
 };
 
-use crate::commit_view::CommitView;
+use crate::{commit_view::CommitView, git_panel::GitStatusEntry, solo_diff_view::SoloDiffView};
 use askpass::AskPassDelegate;
 use git::repository::RepoPath;
 use git_ui_core::askpass_modal::AskPassModal;
@@ -112,8 +112,8 @@ enum UncommittedPart {
     Header,
     Toolbar,
     File(usize),
-    Commit,
-    Amend,
+    /// Amend, Commit and the commit title field.
+    Actions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,7 +269,7 @@ impl LayoutBuilder {
             let parts = [UncommittedPart::Header, UncommittedPart::Toolbar]
                 .into_iter()
                 .chain((0..self.uncommitted_file_count).map(UncommittedPart::File))
-                .chain([UncommittedPart::Commit, UncommittedPart::Amend]);
+                .chain([UncommittedPart::Actions]);
             for part in parts {
                 self.layout.rows.push(LayoutRow {
                     sha: None,
@@ -402,6 +402,10 @@ pub struct Smartlog {
     ref_names: HashMap<Oid, Vec<SharedString>>,
     selected_row: Option<usize>,
     uncommitted_files: Vec<StatusEntry>,
+    /// Files the user unchecked. Everything else is included by Commit and Amend, so files that
+    /// appear later are selected by default, as in ISL.
+    deselected: HashSet<RepoPath>,
+    title_editor: Entity<Editor>,
     error: Option<SharedString>,
     pending_commit_loads: Vec<Task<()>>,
 }
@@ -420,9 +424,15 @@ impl Smartlog {
         git_store: Entity<GitStore>,
         workspace: WeakEntity<Workspace>,
         trunk: SharedString,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Title", window, cx);
+            editor
+        });
+
         cx.subscribe(&git_store, |this, _, event, cx| {
             let GitStoreEvent::RepositoryUpdated(updated_id, event, _) = event else {
                 return;
@@ -452,6 +462,8 @@ impl Smartlog {
             ref_names: HashMap::default(),
             selected_row: None,
             uncommitted_files: Vec::new(),
+            deselected: HashSet::default(),
+            title_editor,
             error: None,
             pending_commit_loads: Vec::new(),
         };
@@ -487,6 +499,12 @@ impl Smartlog {
             .as_ref()
             .and_then(|commit| commit.sha.parse::<Oid>().ok());
         self.uncommitted_files = repository.read(cx).cached_status().collect();
+        let present_paths: HashSet<&RepoPath> = self
+            .uncommitted_files
+            .iter()
+            .map(|entry| &entry.repo_path)
+            .collect();
+        self.deselected.retain(|path| present_paths.contains(path));
 
         let drafts: Vec<(Oid, Option<Oid>)> = draft_commits
             .iter()
@@ -704,36 +722,53 @@ impl Smartlog {
             .into_any_element()
     }
 
-    fn toggle_staged(&self, path: RepoPath, stage: bool, cx: &mut Context<Self>) {
-        let Some(repository) = self.repository(cx) else {
-            return;
-        };
-        repository
-            .update(cx, |repository, cx| {
-                if stage {
-                    repository.stage_entries(vec![path], cx)
-                } else {
-                    repository.unstage_entries(vec![path], cx)
-                }
-            })
-            .detach_and_log_err(cx);
+    fn selected_paths(&self) -> Vec<RepoPath> {
+        self.uncommitted_files
+            .iter()
+            .filter(|entry| !self.deselected.contains(&entry.repo_path))
+            .map(|entry| entry.repo_path.clone())
+            .collect()
     }
 
-    fn amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repository) = self.repository(cx) else {
-            return;
-        };
-        let Some(message) = repository
-            .read(cx)
-            .head_commit
-            .as_ref()
-            .map(|commit| commit.message.clone())
-        else {
-            return;
-        };
+    fn head_is_draft(&self) -> bool {
+        self.layout
+            .rows
+            .iter()
+            .any(|row| row.is_head && row.kind == RowKind::Draft)
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.deselected.clear();
+        cx.notify();
+    }
+
+    fn deselect_all(&mut self, cx: &mut Context<Self>) {
+        self.deselected = self
+            .uncommitted_files
+            .iter()
+            .map(|entry| entry.repo_path.clone())
+            .collect();
+        cx.notify();
+    }
+
+    fn set_selected(&mut self, path: RepoPath, selected: bool, cx: &mut Context<Self>) {
+        if selected {
+            self.deselected.remove(&path);
+        } else {
+            self.deselected.insert(path);
+        }
+        cx.notify();
+    }
+
+    fn askpass_delegate(
+        &self,
+        operation: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AskPassDelegate {
         let workspace = self.workspace.clone();
         let window_handle = window.window_handle();
-        let askpass = AskPassDelegate::new_with_cancellation(
+        AskPassDelegate::new_with_cancellation(
             &mut cx.to_async(),
             move |prompt, tx, cancellation, cx| {
                 window_handle
@@ -741,7 +776,7 @@ impl Smartlog {
                         workspace.update(cx, |workspace, cx| {
                             workspace.toggle_modal(window, cx, |window, cx| {
                                 AskPassModal::new(
-                                    "git commit --amend".into(),
+                                    operation.into(),
                                     prompt.into(),
                                     tx,
                                     cancellation,
@@ -753,19 +788,75 @@ impl Smartlog {
                     })
                     .ok();
             },
-        );
+        )
+    }
 
-        cx.spawn_in(window, async move |_, cx| {
+    /// Commits (or amends with) exactly the checked files: they are staged and every unchecked
+    /// file is unstaged first, because the git index is what a commit is made from.
+    fn commit_selection(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let selected = self.selected_paths();
+        if selected.is_empty() {
+            return;
+        }
+        let unselected: Vec<RepoPath> = self.deselected.iter().cloned().collect();
+
+        let message: SharedString = if amend {
+            let Some(head_commit) = repository.read(cx).head_commit.as_ref() else {
+                return;
+            };
+            head_commit.message.clone()
+        } else {
+            let title = self.title_editor.read(cx).text(cx);
+            let title = title.trim();
+            if title.is_empty() {
+                let now = OffsetDateTime::now_utc();
+                let time = time_format::format_local_timestamp(
+                    OffsetDateTime::now_local().unwrap_or(now),
+                    now,
+                    TimestampFormat::EnhancedAbsolute,
+                );
+                format!("Temporary Commit at {time}").into()
+            } else {
+                title.to_string().into()
+            }
+        };
+
+        let askpass = self.askpass_delegate(
+            if amend {
+                "git commit --amend"
+            } else {
+                "git commit"
+            },
+            window,
+            cx,
+        );
+        let failure_title = if amend {
+            "Failed to amend commit"
+        } else {
+            "Failed to commit"
+        };
+
+        cx.spawn_in(window, async move |this, cx| {
             repository
-                .update(cx, |repository, cx| repository.stage_all(cx))
+                .update(cx, |repository, cx| repository.stage_entries(selected, cx))
                 .await?;
+            if !unselected.is_empty() {
+                repository
+                    .update(cx, |repository, cx| {
+                        repository.unstage_entries(unselected, cx)
+                    })
+                    .await?;
+            }
             repository
                 .update(cx, |repository, cx| {
                     repository.commit(
                         message,
                         None,
                         CommitOptions {
-                            amend: true,
+                            amend,
                             ..Default::default()
                         },
                         askpass,
@@ -773,9 +864,389 @@ impl Smartlog {
                     )
                 })
                 .await??;
+            this.update_in(cx, |this, window, cx| {
+                if !amend {
+                    this.title_editor
+                        .update(cx, |editor, cx| editor.set_text("", window, cx));
+                }
+            })?;
             anyhow::Ok(())
         })
-        .detach_and_prompt_err("Failed to amend commit", window, cx, |_, _, _| None);
+        .detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+    }
+
+    fn discard_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.selected_paths();
+        self.revert_paths(paths, window, cx);
+    }
+
+    /// Reverts tracked files to `HEAD` and trashes files that did not exist there, after asking.
+    fn revert_paths(&mut self, paths: Vec<RepoPath>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let entries: Vec<StatusEntry> = self
+            .uncommitted_files
+            .iter()
+            .filter(|entry| paths.contains(&entry.repo_path))
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+
+        let staged: Vec<RepoPath> = entries
+            .iter()
+            .filter(|entry| entry.status.staging().has_staged())
+            .map(|entry| entry.repo_path.clone())
+            .collect();
+        let (untracked, tracked): (Vec<StatusEntry>, Vec<StatusEntry>) = entries
+            .into_iter()
+            .partition(|entry| entry.status.is_created());
+        let tracked_paths: Vec<RepoPath> = tracked
+            .iter()
+            .map(|entry| entry.repo_path.clone())
+            .collect();
+        let project_paths: Vec<_> = untracked
+            .iter()
+            .filter_map(|entry| {
+                repository
+                    .read(cx)
+                    .repo_path_to_project_path(&entry.repo_path, cx)
+            })
+            .collect();
+
+        let (message, confirm_label) = match (tracked.len(), untracked.len()) {
+            (1, 0) => (
+                "Discard changes to this file? This can't be undone.".to_string(),
+                "Discard",
+            ),
+            (tracked_count, 0) => (
+                format!("Discard changes to {tracked_count} files? This can't be undone."),
+                "Discard",
+            ),
+            (0, untracked_count) => (format!("Trash {untracked_count} files?"), "Trash"),
+            (tracked_count, untracked_count) => (
+                format!(
+                    "Discard changes to {tracked_count} files and trash {untracked_count} files?"
+                ),
+                "Discard and Trash",
+            ),
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            None,
+            &[confirm_label, "Cancel"],
+            cx,
+        );
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+
+            if !staged.is_empty() {
+                repository
+                    .update(cx, |repository, cx| repository.unstage_entries(staged, cx))
+                    .await?;
+            }
+
+            if !tracked_paths.is_empty() {
+                let buffer_tasks: Vec<_> = workspace.update(cx, |workspace, cx| {
+                    workspace.project().update(cx, |project, cx| {
+                        tracked_paths
+                            .iter()
+                            .filter_map(|path| {
+                                let project_path =
+                                    repository.read(cx).repo_path_to_project_path(path, cx)?;
+                                Some(project.open_buffer(project_path, cx))
+                            })
+                            .collect()
+                    })
+                })?;
+                let buffers = futures::future::join_all(buffer_tasks).await;
+
+                repository
+                    .update(cx, |repository, cx| {
+                        repository.checkout_files("HEAD", tracked_paths, cx)
+                    })
+                    .await?;
+
+                let reload_tasks: Vec<_> = cx.update(|_, cx| {
+                    buffers
+                        .iter()
+                        .filter_map(|buffer| {
+                            buffer.as_ref().ok()?.update(cx, |buffer, cx| {
+                                buffer.is_dirty().then(|| buffer.reload(cx))
+                            })
+                        })
+                        .collect()
+                })?;
+                futures::future::join_all(reload_tasks).await;
+            }
+
+            for project_path in project_paths {
+                let task = workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .project()
+                        .update(cx, |project, cx| project.trash_file(project_path, cx))
+                })?;
+                if let Some(task) = task {
+                    task.await?;
+                }
+            }
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to discard changes", window, cx, |_, _, _| None);
+    }
+
+    fn uncommit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Are you sure you want to Uncommit?",
+            Some("The commit is undone and its changes are kept in your working tree."),
+            &["Uncommit", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+            repository
+                .update(cx, |repository, cx| {
+                    repository.reset("HEAD^".to_string(), ResetMode::Soft, cx)
+                })
+                .await??;
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to uncommit", window, cx, |_, _, _| None);
+    }
+
+    fn open_file_diff(&self, entry: &StatusEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let entry = GitStatusEntry {
+            repo_path: entry.repo_path.clone(),
+            status: entry.status,
+            staging: entry.status.staging(),
+            diff_stat: entry.diff_stat,
+        };
+        SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx)
+            .detach_and_prompt_err("Failed to open diff", window, cx, |_, _, _| None);
+    }
+
+    fn open_file(&self, path: &RepoPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_path) = self
+            .repository(cx)
+            .and_then(|repository| repository.read(cx).repo_path_to_project_path(path, cx))
+        else {
+            return;
+        };
+        let task = self
+            .workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path(project_path, None, true, window, cx)
+            })
+            .log_err();
+        if let Some(task) = task {
+            task.detach_and_prompt_err("Failed to open file", window, cx, |_, _, _| None);
+        }
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let everything_selected = self.deselected.is_empty();
+        let nothing_selected = self.selected_paths().is_empty();
+
+        h_flex()
+            .gap_1()
+            .child(
+                Button::new("smartlog-view-changes", "View Changes")
+                    .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .tooltip(Tooltip::text("View all uncommitted changes"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(crate::project_diff::DiffHead), cx);
+                    }),
+            )
+            .child(
+                Button::new("smartlog-select-all", "Select All")
+                    .start_icon(Icon::new(IconName::Check).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .disabled(everything_selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.select_all(cx))),
+            )
+            .child(
+                Button::new("smartlog-deselect-all", "Deselect All")
+                    .start_icon(Icon::new(IconName::Close).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .disabled(nothing_selected)
+                    .on_click(cx.listener(|this, _, _, cx| this.deselect_all(cx))),
+            )
+            .child(
+                Button::new("smartlog-discard", "Discard")
+                    .start_icon(Icon::new(IconName::Trash).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .disabled(nothing_selected)
+                    .tooltip(Tooltip::text(
+                        "Discard the selected changes, including untracked files. This can't be undone.",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.discard_selected(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn render_file(&self, file_index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.uncommitted_files.get(file_index) else {
+            return h_flex().into_any_element();
+        };
+        let status = entry.status;
+        let color = if status.is_created() {
+            Color::Created
+        } else if status.is_deleted() {
+            Color::Deleted
+        } else {
+            Color::Modified
+        };
+        let is_selected = !self.deselected.contains(&entry.repo_path);
+        let group = SharedString::from(format!("smartlog-file-{file_index}"));
+
+        let checkbox_path = entry.repo_path.clone();
+        let diff_entry = entry.clone();
+        let button_entry = entry.clone();
+        let file_path = entry.repo_path.clone();
+        let revert_path = entry.repo_path.clone();
+
+        h_flex()
+            .group(group.clone())
+            .gap_2()
+            .min_w_0()
+            .pr_2()
+            .child(
+                Checkbox::new(
+                    ("smartlog-file-checkbox", file_index),
+                    if is_selected {
+                        ToggleState::Selected
+                    } else {
+                        ToggleState::Unselected
+                    },
+                )
+                .on_click(cx.listener(move |this, state: &ToggleState, _, cx| {
+                    this.set_selected(checkbox_path.clone(), *state == ToggleState::Selected, cx);
+                })),
+            )
+            .child(
+                h_flex()
+                    .id(("smartlog-file-path", file_index))
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(crate::git_status_icon(status))
+                    .child(
+                        Label::new(entry.repo_path.as_unix_str().to_string())
+                            .color(color)
+                            .truncate(),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_file_diff(&diff_entry, window, cx);
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_0p5()
+                    .invisible()
+                    .group_hover(group, |style| style.visible())
+                    .child(
+                        IconButton::new(("smartlog-file-open", file_index), IconName::File)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open file"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_file(&file_path, window, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("smartlog-file-diff", file_index), IconName::Diff)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Open diff view"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_file_diff(&button_entry, window, cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("smartlog-file-revert", file_index), IconName::Undo)
+                            .shape(IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Revert this file"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.revert_paths(vec![revert_path.clone()], window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let nothing_selected = self.selected_paths().is_empty();
+        let colors = cx.theme().colors();
+
+        h_flex()
+            .gap_2()
+            .pr_2()
+            .when(self.head_is_draft(), |this| {
+                this.child(
+                    Button::new("smartlog-amend", "Amend")
+                        .start_icon(Icon::new(IconName::ArrowDown).size(IconSize::Small))
+                        .style(ButtonStyle::Filled)
+                        .size(ButtonSize::Compact)
+                        .disabled(nothing_selected)
+                        .tooltip(Tooltip::text(
+                            "Add the selected changes to the current commit, keeping its message",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.commit_selection(true, window, cx);
+                        })),
+                )
+            })
+            .child(
+                Button::new("smartlog-commit", "Commit")
+                    .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                    .style(ButtonStyle::Filled)
+                    .size(ButtonSize::Compact)
+                    .disabled(nothing_selected)
+                    .tooltip(Tooltip::text("Commit the selected changes"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.commit_selection(false, window, cx);
+                    })),
+            )
+            .child(
+                h_flex()
+                    .h_6()
+                    .w_48()
+                    .px_1p5()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .rounded_md()
+                    .bg(colors.toolbar_background)
+                    .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                        this.commit_selection(false, window, cx);
+                    }))
+                    .child(self.title_editor.clone()),
+            )
+            .into_any_element()
     }
 
     fn render_uncommitted_row(
@@ -789,102 +1260,9 @@ impl Smartlog {
             UncommittedPart::Header => h_flex()
                 .child(Self::you_are_here_pill(cx))
                 .into_any_element(),
-            UncommittedPart::Toolbar => h_flex()
-                .gap_1()
-                .child(
-                    Button::new("smartlog-view-changes", "View Changes")
-                        .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(crate::project_diff::DiffHead), cx);
-                        }),
-                )
-                .child(
-                    Button::new("smartlog-select-all", "Select All")
-                        .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(git::StageAll), cx);
-                        }),
-                )
-                .child(
-                    Button::new("smartlog-deselect-all", "Deselect All")
-                        .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(git::UnstageAll), cx);
-                        }),
-                )
-                .child(
-                    Button::new("smartlog-discard", "Discard")
-                        .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(git::RestoreTrackedFiles), cx);
-                        }),
-                )
-                .into_any_element(),
-            UncommittedPart::File(file_index) => match self.uncommitted_files.get(file_index) {
-                Some(entry) => {
-                    let status = entry.status;
-                    let stage_status = status.staging();
-                    let color = if status.is_created() {
-                        Color::Created
-                    } else if status.is_deleted() {
-                        Color::Deleted
-                    } else {
-                        Color::Modified
-                    };
-                    let path = entry.repo_path.clone();
-                    let toggle_path = path.clone();
-                    h_flex()
-                        .gap_2()
-                        .min_w_0()
-                        .child(
-                            Checkbox::new(
-                                ("smartlog-file-checkbox", file_index),
-                                match stage_status {
-                                    StageStatus::Staged => ToggleState::Selected,
-                                    StageStatus::PartiallyStaged => ToggleState::Indeterminate,
-                                    StageStatus::Unstaged => ToggleState::Unselected,
-                                },
-                            )
-                            .on_click(cx.listener(
-                                move |this, state: &ToggleState, _, cx| {
-                                    this.toggle_staged(
-                                        toggle_path.clone(),
-                                        *state == ToggleState::Selected,
-                                        cx,
-                                    );
-                                },
-                            )),
-                        )
-                        .child(crate::git_status_icon(status))
-                        .child(
-                            Label::new(path.as_unix_str().to_string())
-                                .color(color)
-                                .truncate(),
-                        )
-                        .into_any_element()
-                }
-                None => h_flex().into_any_element(),
-            },
-            UncommittedPart::Commit => Button::new("smartlog-commit", "Commit")
-                .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                .style(ButtonStyle::Subtle)
-                .tooltip(Tooltip::text("Commit the staged changes"))
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(Box::new(git::ExpandCommitEditor), cx);
-                })
-                .into_any_element(),
-            UncommittedPart::Amend => Button::new("smartlog-amend", "Amend")
-                .start_icon(Icon::new(IconName::ArrowDown).size(IconSize::Small))
-                .style(ButtonStyle::Subtle)
-                .tooltip(Tooltip::text("Add all changes to the current commit"))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.amend(window, cx);
-                }))
-                .into_any_element(),
+            UncommittedPart::Toolbar => self.render_toolbar(cx),
+            UncommittedPart::File(file_index) => self.render_file(file_index, cx),
+            UncommittedPart::Actions => self.render_actions(cx),
         };
 
         h_flex()
@@ -1004,9 +1382,9 @@ impl Smartlog {
                                     .tooltip(Tooltip::text(
                                         "Undo this commit, keeping its changes in the working tree",
                                     ))
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(Box::new(git::Uncommit), cx);
-                                    }),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.uncommit(window, cx);
+                                    })),
                             )
                         })
                         .when(!row.is_head, |this| {
@@ -1198,18 +1576,17 @@ mod tests {
                 RowKind::Uncommitted(UncommittedPart::Toolbar),
                 RowKind::Uncommitted(UncommittedPart::File(0)),
                 RowKind::Uncommitted(UncommittedPart::File(1)),
-                RowKind::Uncommitted(UncommittedPart::Commit),
-                RowKind::Uncommitted(UncommittedPart::Amend),
+                RowKind::Uncommitted(UncommittedPart::Actions),
                 RowKind::Public,
                 RowKind::Terminator,
             ]
         );
-        assert!(layout.rows[6].is_head);
+        assert!(layout.rows[5].is_head);
         assert_eq!(
             layout.edges,
             vec![LayoutEdge {
                 child_row: 0,
-                parent_row: 6
+                parent_row: 5
             }]
         );
     }
@@ -1248,5 +1625,194 @@ mod tests {
             column: 0,
             color: 0
         }));
+    }
+
+    #[gpui::test]
+    async fn smartlog_shows_uncommitted_changes(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use git::status::{FileStatus, StatusCode, TrackedStatus};
+        use project::Project;
+        use serde_json::json;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "a.txt": "changed" }),
+        )
+        .await;
+        let head = oid(7);
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("a.txt", "original".to_string())],
+            head.to_string(),
+        );
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[(
+                "a.txt",
+                FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Unmodified,
+                    worktree_status: StatusCode::Modified,
+                }),
+            )],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        smartlog.read_with(&*cx, |smartlog, cx| {
+            assert_eq!(
+                repository
+                    .read(cx)
+                    .head_commit
+                    .as_ref()
+                    .map(|commit| commit.sha.to_string()),
+                Some(head.to_string())
+            );
+            assert_eq!(smartlog.uncommitted_files.len(), 1);
+            assert!(
+                smartlog
+                    .layout
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row.kind, RowKind::Uncommitted(_)))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn smartlog_picks_up_changes_made_after_opening(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use git::status::{FileStatus, StatusCode, TrackedStatus};
+        use project::Project;
+        use serde_json::json;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "a.txt": "changed" }),
+        )
+        .await;
+        let head = oid(7);
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("a.txt", "changed".to_string())],
+            head.to_string(),
+        );
+        fs.set_head_and_index_for_repo(
+            Path::new("/project/.git"),
+            &[("a.txt", "changed".to_string())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        smartlog.read_with(&*cx, |smartlog, _| {
+            assert!(smartlog.uncommitted_files.is_empty());
+        });
+
+        fs.set_status_for_repo(
+            Path::new("/project/.git"),
+            &[(
+                "a.txt",
+                FileStatus::Tracked(TrackedStatus {
+                    index_status: StatusCode::Unmodified,
+                    worktree_status: StatusCode::Modified,
+                }),
+            )],
+        );
+
+        cx.run_until_parked();
+
+        smartlog.read_with(&*cx, |smartlog, cx| {
+            assert_eq!(
+                repository
+                    .read(cx)
+                    .head_commit
+                    .as_ref()
+                    .map(|commit| commit.sha.to_string()),
+                Some(head.to_string())
+            );
+            assert_eq!(smartlog.uncommitted_files.len(), 1);
+            assert!(
+                smartlog
+                    .layout
+                    .rows
+                    .iter()
+                    .any(|row| matches!(row.kind, RowKind::Uncommitted(_)))
+            );
+        });
+
+        smartlog.update(cx, |smartlog, cx| {
+            let path = smartlog.uncommitted_files[0].repo_path.clone();
+            assert_eq!(smartlog.selected_paths(), vec![path.clone()]);
+
+            smartlog.deselect_all(cx);
+            assert!(smartlog.selected_paths().is_empty());
+
+            smartlog.set_selected(path.clone(), true, cx);
+            assert_eq!(smartlog.selected_paths(), vec![path]);
+
+            smartlog.deselect_all(cx);
+            smartlog.select_all(cx);
+            assert!(smartlog.deselected.is_empty());
+        });
     }
 }
