@@ -2,7 +2,8 @@ use anyhow::Context as _;
 use collections::HashMap;
 use git::{
     Oid,
-    repository::{InitialGraphCommitData, LogOrder, LogSource},
+    repository::{CommitOptions, InitialGraphCommitData, LogOrder, LogSource},
+    status::StageStatus,
 };
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
@@ -10,11 +11,12 @@ use gpui::{
 };
 use project::git_store::{
     CommitDataState, GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
+    StatusEntry,
 };
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time_format::TimestampFormat;
-use ui::{Chip, IconButtonShape, Tooltip, prelude::*};
+use ui::{Checkbox, Chip, IconButtonShape, ToggleState, Tooltip, prelude::*};
 use util::ResultExt;
 use workspace::{
     Workspace,
@@ -23,6 +25,9 @@ use workspace::{
 };
 
 use crate::commit_view::CommitView;
+use askpass::AskPassDelegate;
+use git::repository::RepoPath;
+use git_ui_core::askpass_modal::AskPassModal;
 
 const ROW_HEIGHT: Pixels = px(48.0);
 const ELBOW_RADIUS: Pixels = px(8.0);
@@ -94,12 +99,21 @@ enum RowKind {
     /// A commit on the trunk that draft commits are based on.
     Public,
     Draft,
-    /// Stands in for the uncommitted changes in the working tree, directly above `HEAD`.
-    Uncommitted,
+    /// A row of the uncommitted changes section, which sits directly above `HEAD`.
+    Uncommitted(UncommittedPart),
     /// Closes the trunk line below the oldest trunk commit, signalling that history continues.
     Terminator,
     /// Blank row in front of a commit where stacks branching off it curve back into its column.
     Link,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UncommittedPart {
+    Header,
+    Toolbar,
+    File(usize),
+    Commit,
+    Amend,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,7 +148,7 @@ struct Layout {
 fn build_layout(
     drafts: &[(Oid, Option<Oid>)],
     head: Option<Oid>,
-    has_uncommitted_changes: bool,
+    uncommitted_file_count: usize,
 ) -> Layout {
     let draft_shas: collections::HashSet<Oid> = drafts.iter().map(|(sha, _)| *sha).collect();
 
@@ -162,7 +176,7 @@ fn build_layout(
     let mut builder = LayoutBuilder {
         children_by_parent,
         head,
-        has_uncommitted_changes,
+        uncommitted_file_count,
         layout: Layout::default(),
     };
 
@@ -207,7 +221,7 @@ fn build_layout(
 struct LayoutBuilder {
     children_by_parent: HashMap<Oid, Vec<Oid>>,
     head: Option<Oid>,
-    has_uncommitted_changes: bool,
+    uncommitted_file_count: usize,
     layout: Layout,
 }
 
@@ -250,14 +264,21 @@ impl LayoutBuilder {
             });
 
         let is_head = self.head == Some(sha);
-        let uncommitted_row = (is_head && self.has_uncommitted_changes).then(|| {
-            self.layout.rows.push(LayoutRow {
-                sha: None,
-                kind: RowKind::Uncommitted,
-                column,
-                is_head: false,
-            });
-            self.layout.rows.len() - 1
+        let uncommitted_row = (is_head && self.uncommitted_file_count > 0).then(|| {
+            let first_row = self.layout.rows.len();
+            let parts = [UncommittedPart::Header, UncommittedPart::Toolbar]
+                .into_iter()
+                .chain((0..self.uncommitted_file_count).map(UncommittedPart::File))
+                .chain([UncommittedPart::Commit, UncommittedPart::Amend]);
+            for part in parts {
+                self.layout.rows.push(LayoutRow {
+                    sha: None,
+                    kind: RowKind::Uncommitted(part),
+                    column,
+                    is_head: false,
+                });
+            }
+            first_row
         });
 
         self.layout.rows.push(LayoutRow {
@@ -380,6 +401,7 @@ pub struct Smartlog {
     commits: HashMap<Oid, Arc<git::repository::CommitData>>,
     ref_names: HashMap<Oid, Vec<SharedString>>,
     selected_row: Option<usize>,
+    uncommitted_files: Vec<StatusEntry>,
     error: Option<SharedString>,
     pending_commit_loads: Vec<Task<()>>,
 }
@@ -429,6 +451,7 @@ impl Smartlog {
             commits: HashMap::default(),
             ref_names: HashMap::default(),
             selected_row: None,
+            uncommitted_files: Vec::new(),
             error: None,
             pending_commit_loads: Vec::new(),
         };
@@ -463,7 +486,7 @@ impl Smartlog {
             .head_commit
             .as_ref()
             .and_then(|commit| commit.sha.parse::<Oid>().ok());
-        let has_uncommitted_changes = repository.read(cx).status_summary().count > 0;
+        self.uncommitted_files = repository.read(cx).cached_status().collect();
 
         let drafts: Vec<(Oid, Option<Oid>)> = draft_commits
             .iter()
@@ -477,7 +500,7 @@ impl Smartlog {
             .selected_row
             .and_then(|row| self.layout.rows.get(row))
             .and_then(|row| row.sha);
-        self.layout = build_layout(&drafts, head, has_uncommitted_changes);
+        self.layout = build_layout(&drafts, head, self.uncommitted_files.len());
         self.segments = row_segments(&self.layout);
         self.selected_row = selected_sha
             .and_then(|sha| self.layout.rows.iter().position(|row| row.sha == Some(sha)));
@@ -639,7 +662,10 @@ impl Smartlog {
 
         let colors = cx.theme().colors();
         let accent = self.lane_color(row.column, cx);
-        if matches!(row.kind, RowKind::Terminator | RowKind::Link) {
+        if matches!(
+            row.kind,
+            RowKind::Terminator | RowKind::Link | RowKind::Uncommitted(_)
+        ) {
             return gutter.into_any_element();
         }
 
@@ -653,7 +679,7 @@ impl Smartlog {
             .map(|node| match row.kind {
                 RowKind::Draft => node.border_color(accent).bg(accent),
                 RowKind::Public => node.border_color(accent).bg(colors.background),
-                RowKind::Uncommitted | RowKind::Terminator | RowKind::Link => node
+                RowKind::Uncommitted(_) | RowKind::Terminator | RowKind::Link => node
                     .border_color(colors.text_muted)
                     .border_dashed()
                     .bg(colors.background),
@@ -664,20 +690,232 @@ impl Smartlog {
         gutter.child(node).into_any_element()
     }
 
+    fn you_are_here_pill(cx: &App) -> AnyElement {
+        div()
+            .flex_none()
+            .px_2()
+            .rounded_full()
+            .bg(cx.theme().status().info_border)
+            .child(
+                Label::new("You are here")
+                    .size(LabelSize::Small)
+                    .color(Color::Default),
+            )
+            .into_any_element()
+    }
+
+    fn toggle_staged(&self, path: RepoPath, stage: bool, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        repository
+            .update(cx, |repository, cx| {
+                if stage {
+                    repository.stage_entries(vec![path], cx)
+                } else {
+                    repository.unstage_entries(vec![path], cx)
+                }
+            })
+            .detach_and_log_err(cx);
+    }
+
+    fn amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let Some(message) = repository
+            .read(cx)
+            .head_commit
+            .as_ref()
+            .map(|commit| commit.message.clone())
+        else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let window_handle = window.window_handle();
+        let askpass = AskPassDelegate::new_with_cancellation(
+            &mut cx.to_async(),
+            move |prompt, tx, cancellation, cx| {
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.toggle_modal(window, cx, |window, cx| {
+                                AskPassModal::new(
+                                    "git commit --amend".into(),
+                                    prompt.into(),
+                                    tx,
+                                    cancellation,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        })
+                    })
+                    .ok();
+            },
+        );
+
+        cx.spawn_in(window, async move |_, cx| {
+            repository
+                .update(cx, |repository, cx| repository.stage_all(cx))
+                .await?;
+            repository
+                .update(cx, |repository, cx| {
+                    repository.commit(
+                        message,
+                        None,
+                        CommitOptions {
+                            amend: true,
+                            ..Default::default()
+                        },
+                        askpass,
+                        cx,
+                    )
+                })
+                .await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to amend commit", window, cx, |_, _, _| None);
+    }
+
+    fn render_uncommitted_row(
+        &self,
+        index: usize,
+        row: &LayoutRow,
+        part: UncommittedPart,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let content = match part {
+            UncommittedPart::Header => h_flex()
+                .child(Self::you_are_here_pill(cx))
+                .into_any_element(),
+            UncommittedPart::Toolbar => h_flex()
+                .gap_1()
+                .child(
+                    Button::new("smartlog-view-changes", "View Changes")
+                        .style(ButtonStyle::Subtle)
+                        .size(ButtonSize::Compact)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(crate::project_diff::DiffHead), cx);
+                        }),
+                )
+                .child(
+                    Button::new("smartlog-select-all", "Select All")
+                        .style(ButtonStyle::Subtle)
+                        .size(ButtonSize::Compact)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(git::StageAll), cx);
+                        }),
+                )
+                .child(
+                    Button::new("smartlog-deselect-all", "Deselect All")
+                        .style(ButtonStyle::Subtle)
+                        .size(ButtonSize::Compact)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(git::UnstageAll), cx);
+                        }),
+                )
+                .child(
+                    Button::new("smartlog-discard", "Discard")
+                        .style(ButtonStyle::Subtle)
+                        .size(ButtonSize::Compact)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(git::RestoreTrackedFiles), cx);
+                        }),
+                )
+                .into_any_element(),
+            UncommittedPart::File(file_index) => match self.uncommitted_files.get(file_index) {
+                Some(entry) => {
+                    let status = entry.status;
+                    let stage_status = status.staging();
+                    let color = if status.is_created() {
+                        Color::Created
+                    } else if status.is_deleted() {
+                        Color::Deleted
+                    } else {
+                        Color::Modified
+                    };
+                    let path = entry.repo_path.clone();
+                    let toggle_path = path.clone();
+                    h_flex()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            Checkbox::new(
+                                ("smartlog-file-checkbox", file_index),
+                                match stage_status {
+                                    StageStatus::Staged => ToggleState::Selected,
+                                    StageStatus::PartiallyStaged => ToggleState::Indeterminate,
+                                    StageStatus::Unstaged => ToggleState::Unselected,
+                                },
+                            )
+                            .on_click(cx.listener(
+                                move |this, state: &ToggleState, _, cx| {
+                                    this.toggle_staged(
+                                        toggle_path.clone(),
+                                        *state == ToggleState::Selected,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                        .child(crate::git_status_icon(status))
+                        .child(
+                            Label::new(path.as_unix_str().to_string())
+                                .color(color)
+                                .truncate(),
+                        )
+                        .into_any_element()
+                }
+                None => h_flex().into_any_element(),
+            },
+            UncommittedPart::Commit => Button::new("smartlog-commit", "Commit")
+                .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                .style(ButtonStyle::Subtle)
+                .tooltip(Tooltip::text("Commit the staged changes"))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(git::ExpandCommitEditor), cx);
+                })
+                .into_any_element(),
+            UncommittedPart::Amend => Button::new("smartlog-amend", "Amend")
+                .start_icon(Icon::new(IconName::ArrowDown).size(IconSize::Small))
+                .style(ButtonStyle::Subtle)
+                .tooltip(Tooltip::text("Add all changes to the current commit"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.amend(window, cx);
+                }))
+                .into_any_element(),
+        };
+
+        h_flex()
+            .id(("smartlog-row", index))
+            .h(ROW_HEIGHT)
+            .w_full()
+            .child(self.render_gutter(index, row, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
     fn render_row(&self, index: usize, row: &LayoutRow, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
+        if let RowKind::Uncommitted(part) = row.kind {
+            return self.render_uncommitted_row(index, row, part, cx);
+        }
         let is_selected = self.selected_row == Some(index);
         let sha = row.sha;
 
         let summary = match (row.kind, sha) {
             (RowKind::Terminator | RowKind::Link, _) => h_flex(),
-            (RowKind::Uncommitted, _) | (_, None) => {
-                let count = self
-                    .repository(cx)
-                    .map_or(0, |repository| repository.read(cx).status_summary().count);
-                h_flex()
-                    .child(Label::new(format!("Uncommitted changes ({count})")).color(Color::Muted))
-            }
+            (_, None) => h_flex(),
             (_, Some(sha)) => {
                 let commit = self.commits.get(&sha);
                 let subject = commit.map_or_else(
@@ -728,19 +966,8 @@ impl Smartlog {
                                 Chip::new(name).label_size(LabelSize::Small)
                             }),
                     )
-                    .when(row.is_head, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .px_2()
-                                .rounded_full()
-                                .bg(cx.theme().status().info_border)
-                                .child(
-                                    Label::new("You are here")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Default),
-                                ),
-                        )
+                    .when(row.is_head && self.uncommitted_files.is_empty(), |this| {
+                        this.child(Self::you_are_here_pill(cx))
                     })
             }
         };
@@ -763,21 +990,6 @@ impl Smartlog {
                     .justify_center()
                     .child(summary),
             )
-            .when(row.kind == RowKind::Uncommitted, |this| {
-                this.child(
-                    h_flex().pr_2().child(
-                        Button::new("smartlog-commit", "Commit")
-                            .style(ButtonStyle::Filled)
-                            .tooltip(Tooltip::text(
-                                "Stage all changes and write a commit message",
-                            ))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(git::StageAll), cx);
-                                window.dispatch_action(Box::new(git::ExpandCommitEditor), cx);
-                            }),
-                    ),
-                )
-            })
             .when_some(sha, |this, sha| {
                 this.child(
                     h_flex()
@@ -940,7 +1152,7 @@ mod tests {
     #[test]
     fn linear_stack_sits_next_to_its_trunk_commit() {
         let (trunk, a, b) = (oid(1), oid(2), oid(3));
-        let layout = build_layout(&[(b, Some(a)), (a, Some(trunk))], Some(b), false);
+        let layout = build_layout(&[(b, Some(a)), (a, Some(trunk))], Some(b), 0);
 
         assert_eq!(
             shas(&layout),
@@ -960,7 +1172,7 @@ mod tests {
     #[test]
     fn forks_get_their_own_column() {
         let (trunk, a, b, c) = (oid(1), oid(2), oid(3), oid(4));
-        let layout = build_layout(&[(c, Some(a)), (b, Some(a)), (a, Some(trunk))], None, false);
+        let layout = build_layout(&[(c, Some(a)), (b, Some(a)), (a, Some(trunk))], None, 0);
 
         let columns: HashMap<Oid, usize> = layout
             .rows
@@ -976,36 +1188,28 @@ mod tests {
     #[test]
     fn head_on_trunk_is_shown_with_uncommitted_changes_above_it() {
         let trunk = oid(1);
-        let layout = build_layout(&[], Some(trunk), true);
+        let layout = build_layout(&[], Some(trunk), 2);
 
+        let kinds: Vec<RowKind> = layout.rows.iter().map(|row| row.kind).collect();
         assert_eq!(
-            layout.rows,
+            kinds,
             vec![
-                LayoutRow {
-                    sha: None,
-                    kind: RowKind::Uncommitted,
-                    column: 0,
-                    is_head: false,
-                },
-                LayoutRow {
-                    sha: Some(trunk),
-                    kind: RowKind::Public,
-                    column: 0,
-                    is_head: true,
-                },
-                LayoutRow {
-                    sha: None,
-                    kind: RowKind::Terminator,
-                    column: 0,
-                    is_head: false,
-                },
+                RowKind::Uncommitted(UncommittedPart::Header),
+                RowKind::Uncommitted(UncommittedPart::Toolbar),
+                RowKind::Uncommitted(UncommittedPart::File(0)),
+                RowKind::Uncommitted(UncommittedPart::File(1)),
+                RowKind::Uncommitted(UncommittedPart::Commit),
+                RowKind::Uncommitted(UncommittedPart::Amend),
+                RowKind::Public,
+                RowKind::Terminator,
             ]
         );
+        assert!(layout.rows[6].is_head);
         assert_eq!(
             layout.edges,
             vec![LayoutEdge {
                 child_row: 0,
-                parent_row: 1
+                parent_row: 6
             }]
         );
     }
@@ -1013,7 +1217,7 @@ mod tests {
     #[test]
     fn separate_trunk_commits_are_joined_by_a_trunk_edge() {
         let (trunk_a, trunk_b, a, b) = (oid(1), oid(2), oid(3), oid(4));
-        let layout = build_layout(&[(a, Some(trunk_a)), (b, Some(trunk_b))], None, false);
+        let layout = build_layout(&[(a, Some(trunk_a)), (b, Some(trunk_b))], None, 0);
 
         assert_eq!(layout.trunk_edges.len(), 2);
         let public_rows = layout
@@ -1027,7 +1231,7 @@ mod tests {
     #[test]
     fn segments_connect_a_branch_back_to_the_trunk() {
         let (trunk, a) = (oid(1), oid(2));
-        let layout = build_layout(&[(a, Some(trunk))], None, false);
+        let layout = build_layout(&[(a, Some(trunk))], None, 0);
         let segments = row_segments(&layout);
 
         assert!(segments[0].contains(&Segment::Down {
