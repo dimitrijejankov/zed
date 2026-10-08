@@ -24,7 +24,8 @@ use workspace::{
 
 use crate::commit_view::CommitView;
 
-const ROW_HEIGHT: Pixels = px(30.0);
+const ROW_HEIGHT: Pixels = px(44.0);
+const LIST_VERTICAL_PADDING: Pixels = px(16.0);
 const LANE_WIDTH: Pixels = px(18.0);
 const LEFT_PADDING: Pixels = px(10.0);
 const LINE_WIDTH: Pixels = px(2.0);
@@ -92,6 +93,8 @@ enum RowKind {
     Draft,
     /// Stands in for the uncommitted changes in the working tree, directly above `HEAD`.
     Uncommitted,
+    /// Closes the trunk line below the oldest trunk commit, signalling that history continues.
+    Terminator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,6 +173,19 @@ fn build_layout(
         builder.layout.trunk_edges.push(LayoutEdge {
             child_row: pair[0],
             parent_row: pair[1],
+        });
+    }
+
+    if let Some(&last_trunk_row) = trunk_rows.last() {
+        builder.layout.rows.push(LayoutRow {
+            sha: None,
+            kind: RowKind::Terminator,
+            column: 0,
+            is_head: false,
+        });
+        builder.layout.trunk_edges.push(LayoutEdge {
+            child_row: last_trunk_row,
+            parent_row: builder.layout.rows.len() - 1,
         });
     }
 
@@ -552,6 +568,21 @@ impl Smartlog {
 
         let colors = cx.theme().colors();
         let accent = self.lane_color(row.column, cx);
+        if row.kind == RowKind::Terminator {
+            return gutter
+                .child(
+                    div()
+                        .absolute()
+                        .left(Self::lane_x(0) - LANE_WIDTH / 2.0)
+                        .top(half_row)
+                        .w(LANE_WIDTH)
+                        .flex()
+                        .justify_center()
+                        .child(Label::new("~").color(Color::Muted)),
+                )
+                .into_any_element();
+        }
+
         let node = div()
             .absolute()
             .left(Self::lane_x(row.column) - NODE_DIAMETER / 2.0)
@@ -562,7 +593,7 @@ impl Smartlog {
             .map(|node| match row.kind {
                 RowKind::Draft => node.border_color(accent).bg(accent),
                 RowKind::Public => node.border_color(accent).bg(colors.background),
-                RowKind::Uncommitted => node
+                RowKind::Uncommitted | RowKind::Terminator => node
                     .border_color(colors.text_muted)
                     .border_dashed()
                     .bg(colors.background),
@@ -576,6 +607,7 @@ impl Smartlog {
         let sha = row.sha;
 
         let summary = match (row.kind, sha) {
+            (RowKind::Terminator, _) => h_flex(),
             (RowKind::Uncommitted, _) | (_, None) => {
                 let count = self
                     .repository(cx)
@@ -603,33 +635,37 @@ impl Smartlog {
                     format!("{author} · {timestamp}")
                 });
 
-                h_flex()
-                    .gap_2()
+                v_flex()
                     .min_w_0()
                     .child(
-                        Label::new(subject)
-                            .truncate()
-                            .when(row.kind == RowKind::Public, |label| {
-                                label.color(Color::Muted)
+                        h_flex()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                Label::new(subject)
+                                    .truncate()
+                                    .when(row.kind == RowKind::Public, |label| {
+                                        label.color(Color::Muted)
+                                    }),
+                            )
+                            .children(
+                                self.ref_names
+                                    .get(&sha)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|name| !name.as_ref().starts_with("tag: "))
+                                    .map(|name| {
+                                        let name = name
+                                            .strip_prefix("HEAD -> ")
+                                            .unwrap_or(name.as_ref())
+                                            .to_string();
+                                        Chip::new(name).label_size(LabelSize::Small)
+                                    }),
+                            )
+                            .when(row.is_head, |this| {
+                                this.child(Chip::new("You are here").label_size(LabelSize::Small))
                             }),
                     )
-                    .children(
-                        self.ref_names
-                            .get(&sha)
-                            .into_iter()
-                            .flatten()
-                            .filter(|name| !name.as_ref().starts_with("tag: "))
-                            .map(|name| {
-                                let name = name
-                                    .strip_prefix("HEAD -> ")
-                                    .unwrap_or(name.as_ref())
-                                    .to_string();
-                                Chip::new(name).label_size(LabelSize::Small)
-                            }),
-                    )
-                    .when(row.is_head, |this| {
-                        this.child(Chip::new("You are here").label_size(LabelSize::Small))
-                    })
                     .when_some(details, |this, details| {
                         this.child(
                             Label::new(details)
@@ -649,7 +685,16 @@ impl Smartlog {
             .when(is_selected, |this| this.bg(colors.element_selected))
             .hover(|this| this.bg(colors.element_hover))
             .child(self.render_gutter(index, row, cx))
-            .child(div().flex_1().min_w_0().child(summary))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(summary),
+            )
             .when_some(sha, |this, sha| {
                 this.child(
                     h_flex()
@@ -712,6 +757,8 @@ impl Render for Smartlog {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .overflow_y_scroll()
+            .pt(LIST_VERTICAL_PADDING)
+            .pb(LIST_VERTICAL_PADDING)
             .when_some(self.error.clone(), |this, error| {
                 this.child(Label::new(error).color(Color::Error).m_2())
             })
@@ -768,7 +815,7 @@ mod tests {
 
         assert_eq!(
             shas(&layout),
-            vec![(Some(b), 1), (Some(a), 1), (Some(trunk), 0)]
+            vec![(Some(b), 1), (Some(a), 1), (Some(trunk), 0), (None, 0)]
         );
         assert!(layout.rows[0].is_head);
         assert_eq!(layout.rows[2].kind, RowKind::Public);
@@ -811,6 +858,12 @@ mod tests {
                     column: 0,
                     is_head: true,
                 },
+                LayoutRow {
+                    sha: None,
+                    kind: RowKind::Terminator,
+                    column: 0,
+                    is_head: false,
+                },
             ]
         );
         assert_eq!(
@@ -827,7 +880,7 @@ mod tests {
         let (trunk_a, trunk_b, a, b) = (oid(1), oid(2), oid(3), oid(4));
         let layout = build_layout(&[(a, Some(trunk_a)), (b, Some(trunk_b))], None, false);
 
-        assert_eq!(layout.trunk_edges.len(), 1);
+        assert_eq!(layout.trunk_edges.len(), 2);
         let public_rows = layout
             .rows
             .iter()
