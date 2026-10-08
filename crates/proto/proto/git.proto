@@ -796,6 +796,7 @@ message GitLogSource {
     string branch = 2;
     string sha = 3;
     string path = 4;
+    string draft = 5;
   }
 }
 

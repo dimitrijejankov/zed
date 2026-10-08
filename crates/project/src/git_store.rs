@@ -11207,6 +11207,7 @@ fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
             LogSource::Path(path) => {
                 proto::git_log_source::Source::Path(path.as_unix_str().to_owned())
             }
+            LogSource::Draft(trunk) => proto::git_log_source::Source::Draft(trunk.to_string()),
         }),
     }
 }
@@ -11222,6 +11223,7 @@ fn log_source_from_proto(log_source: proto::GitLogSource) -> Result<LogSource> {
         proto::git_log_source::Source::Path(path) => {
             Ok(LogSource::Path(RepoPath::from_proto(&path)?))
         }
+        proto::git_log_source::Source::Draft(trunk) => Ok(LogSource::Draft(trunk.into())),
     }
 }
 

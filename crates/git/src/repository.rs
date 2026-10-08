@@ -734,6 +734,8 @@ pub enum LogSource {
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
+    /// Commits reachable from local branches or HEAD but not from `trunk`.
+    Draft(SharedString),
 }
 
 impl LogSource {
@@ -748,6 +750,13 @@ impl LogSource {
             ],
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
+            LogSource::Draft(trunk) => vec![
+                Cow::Borrowed("--ignore-missing"),
+                Cow::Borrowed("--branches"),
+                Cow::Borrowed("HEAD"),
+                Cow::Borrowed("--not"),
+                Cow::Borrowed(trunk.as_str()),
+            ],
             LogSource::Path(path) => vec![
                 Cow::Borrowed("--follow"),
                 Cow::Borrowed("--"),
