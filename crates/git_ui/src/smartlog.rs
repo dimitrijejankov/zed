@@ -763,6 +763,21 @@ impl Smartlog {
                     .justify_center()
                     .child(summary),
             )
+            .when(row.kind == RowKind::Uncommitted, |this| {
+                this.child(
+                    h_flex().pr_2().child(
+                        Button::new("smartlog-commit", "Commit")
+                            .style(ButtonStyle::Filled)
+                            .tooltip(Tooltip::text(
+                                "Stage all changes and write a commit message",
+                            ))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(git::StageAll), cx);
+                                window.dispatch_action(Box::new(git::ExpandCommitEditor), cx);
+                            }),
+                    ),
+                )
+            })
             .when_some(sha, |this, sha| {
                 this.child(
                     h_flex()
@@ -770,6 +785,18 @@ impl Smartlog {
                         .gap_1()
                         .invisible()
                         .group_hover("smartlog-row", |style| style.visible())
+                        .when(row.is_head && row.kind == RowKind::Draft, |this| {
+                            this.child(
+                                Button::new(("smartlog-uncommit", index), "Uncommit")
+                                    .style(ButtonStyle::Filled)
+                                    .tooltip(Tooltip::text(
+                                        "Undo this commit, keeping its changes in the working tree",
+                                    ))
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(git::Uncommit), cx);
+                                    }),
+                            )
+                        })
                         .when(!row.is_head, |this| {
                             this.child(
                                 IconButton::new(("smartlog-goto", index), IconName::ArrowRight)
