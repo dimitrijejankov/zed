@@ -24,13 +24,13 @@ use workspace::{
 
 use crate::commit_view::CommitView;
 
-const ROW_HEIGHT: Pixels = px(36.0);
+const ROW_HEIGHT: Pixels = px(48.0);
 const ELBOW_RADIUS: Pixels = px(8.0);
 const DASH_LENGTH: Pixels = px(4.0);
 const DASH_GAP: Pixels = px(3.0);
-const LIST_VERTICAL_PADDING: Pixels = px(16.0);
-const LANE_WIDTH: Pixels = px(18.0);
-const LEFT_PADDING: Pixels = px(10.0);
+const LIST_VERTICAL_PADDING: Pixels = px(24.0);
+const LANE_WIDTH: Pixels = px(24.0);
+const LEFT_PADDING: Pixels = px(20.0);
 const LINE_WIDTH: Pixels = px(2.0);
 const NODE_DIAMETER: Pixels = px(10.0);
 
@@ -697,7 +697,7 @@ impl Smartlog {
                 });
 
                 h_flex()
-                    .gap_2()
+                    .gap_3()
                     .min_w_0()
                     .child(
                         Label::new(subject)
@@ -818,29 +818,63 @@ impl Render for Smartlog {
             .map(|(index, row)| self.render_row(index, row, cx))
             .collect();
 
+        let header = h_flex()
+            .flex_none()
+            .w_full()
+            .px_4()
+            .py_2()
+            .gap_2()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Button::new("smartlog-pull", "Pull")
+                    .start_icon(Icon::new(IconName::ArrowDown).size(IconSize::Small))
+                    .style(ButtonStyle::Filled)
+                    .tooltip(Tooltip::text("Fetch new commits from the remote"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(git::Fetch), cx);
+                    }),
+            )
+            .child(
+                IconButton::new("smartlog-refresh", IconName::ArrowCircle)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Refresh"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.refresh(cx);
+                    })),
+            );
+
         v_flex()
             .id("smartlog")
             .key_context("Smartlog")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .overflow_y_scroll()
-            .pt(LIST_VERTICAL_PADDING)
-            .pb(LIST_VERTICAL_PADDING)
-            .when_some(self.error.clone(), |this, error| {
-                this.child(Label::new(error).color(Color::Error).m_2())
-            })
-            .when(rows.is_empty() && self.error.is_none(), |this| {
-                this.child(
-                    Label::new(format!(
-                        "No draft commits. Everything is already on {}.",
-                        self.trunk
-                    ))
-                    .color(Color::Muted)
-                    .m_2(),
-                )
-            })
-            .children(rows)
+            .child(header)
+            .child(
+                v_flex()
+                    .id("smartlog-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .pt(LIST_VERTICAL_PADDING)
+                    .pb(LIST_VERTICAL_PADDING)
+                    .when_some(self.error.clone(), |this, error| {
+                        this.child(Label::new(error).color(Color::Error).m_2())
+                    })
+                    .when(rows.is_empty() && self.error.is_none(), |this| {
+                        this.child(
+                            Label::new(format!(
+                                "No draft commits. Everything is already on {}.",
+                                self.trunk
+                            ))
+                            .color(Color::Muted)
+                            .m_2(),
+                        )
+                    })
+                    .children(rows),
+            )
     }
 }
 
