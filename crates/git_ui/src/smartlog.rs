@@ -24,7 +24,10 @@ use workspace::{
 
 use crate::commit_view::CommitView;
 
-const ROW_HEIGHT: Pixels = px(44.0);
+const ROW_HEIGHT: Pixels = px(36.0);
+const ELBOW_RADIUS: Pixels = px(8.0);
+const DASH_LENGTH: Pixels = px(4.0);
+const DASH_GAP: Pixels = px(3.0);
 const LIST_VERTICAL_PADDING: Pixels = px(16.0);
 const LANE_WIDTH: Pixels = px(18.0);
 const LEFT_PADDING: Pixels = px(10.0);
@@ -95,6 +98,8 @@ enum RowKind {
     Uncommitted,
     /// Closes the trunk line below the oldest trunk commit, signalling that history continues.
     Terminator,
+    /// Blank row in front of a commit where stacks branching off it curve back into its column.
+    Link,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,6 +236,19 @@ impl LayoutBuilder {
             next_free_column = next_free_column.max(rightmost + 1);
         }
 
+        let link_row = child_rows
+            .iter()
+            .any(|&child_row| self.layout.rows[child_row].column != column)
+            .then(|| {
+                self.layout.rows.push(LayoutRow {
+                    sha: None,
+                    kind: RowKind::Link,
+                    column,
+                    is_head: false,
+                });
+                self.layout.rows.len() - 1
+            });
+
         let is_head = self.head == Some(sha);
         let uncommitted_row = (is_head && self.has_uncommitted_changes).then(|| {
             self.layout.rows.push(LayoutRow {
@@ -250,7 +268,17 @@ impl LayoutBuilder {
         });
         let row = self.layout.rows.len() - 1;
 
-        for child_row in child_rows.into_iter().chain(uncommitted_row) {
+        for child_row in child_rows {
+            let parent_row = match link_row {
+                Some(link_row) if self.layout.rows[child_row].column != column => link_row,
+                _ => row,
+            };
+            self.layout.edges.push(LayoutEdge {
+                child_row,
+                parent_row,
+            });
+        }
+        for child_row in link_row.into_iter().chain(uncommitted_row) {
             self.layout.edges.push(LayoutEdge {
                 child_row,
                 parent_row: row,
@@ -281,7 +309,9 @@ enum Segment {
     Down { column: usize, color: usize },
     /// Vertical line from the row's top to its center.
     Up { column: usize, color: usize },
-    Horizontal {
+    /// Comes down the `to` column from the row's top edge and curves left to meet the `from`
+    /// column at the row's center.
+    Elbow {
         from: usize,
         to: usize,
         color: usize,
@@ -314,14 +344,15 @@ fn row_segments(layout: &Layout) -> Vec<Vec<Segment>> {
             }
         }
         if let Some(row_segments) = segments.get_mut(edge.parent_row) {
-            row_segments.push(Segment::Up {
-                column: child.column,
-                color,
-            });
-            if child.column != parent.column {
-                row_segments.push(Segment::Horizontal {
-                    from: child.column.min(parent.column),
-                    to: child.column.max(parent.column),
+            if child.column == parent.column {
+                row_segments.push(Segment::Up {
+                    column: child.column,
+                    color,
+                });
+            } else {
+                row_segments.push(Segment::Elbow {
+                    from: parent.column,
+                    to: child.column,
                     color,
                 });
             }
@@ -527,6 +558,33 @@ impl Smartlog {
         LEFT_PADDING + LANE_WIDTH * column as f32 + LANE_WIDTH / 2.0
     }
 
+    fn dashed_vertical(
+        &self,
+        column: usize,
+        top: Pixels,
+        height: Pixels,
+        color: usize,
+        cx: &App,
+    ) -> AnyElement {
+        let dash_color = self.lane_color(color, cx);
+        let dash_count = (height / (DASH_LENGTH + DASH_GAP)).ceil() as usize;
+        v_flex()
+            .absolute()
+            .left(Self::lane_x(column) - LINE_WIDTH / 2.0)
+            .top(top)
+            .h(height)
+            .overflow_hidden()
+            .gap(DASH_GAP)
+            .children((0..dash_count).map(|_| {
+                div()
+                    .flex_none()
+                    .w(LINE_WIDTH)
+                    .h(DASH_LENGTH)
+                    .bg(dash_color)
+            }))
+            .into_any_element()
+    }
+
     fn render_gutter(&self, row_index: usize, row: &LayoutRow, cx: &App) -> AnyElement {
         let width = LEFT_PADDING * 2.0 + LANE_WIDTH * self.layout.column_count as f32;
         let half_row = ROW_HEIGHT / 2.0;
@@ -548,6 +606,16 @@ impl Smartlog {
                     .w(LINE_WIDTH)
                     .h(half_row)
                     .bg(self.lane_color(color, cx)),
+                Segment::Up { column, color } if row.kind == RowKind::Terminator => {
+                    gutter = gutter.child(self.dashed_vertical(
+                        column,
+                        Pixels::ZERO,
+                        half_row + ELBOW_RADIUS,
+                        color,
+                        cx,
+                    ));
+                    continue;
+                }
                 Segment::Up { column, color } => div()
                     .absolute()
                     .left(Self::lane_x(column) - LINE_WIDTH / 2.0)
@@ -555,32 +623,24 @@ impl Smartlog {
                     .w(LINE_WIDTH)
                     .h(half_row)
                     .bg(self.lane_color(color, cx)),
-                Segment::Horizontal { from, to, color } => div()
+                Segment::Elbow { from, to, color } => div()
                     .absolute()
-                    .left(Self::lane_x(from) - LINE_WIDTH / 2.0)
-                    .top(half_row - LINE_WIDTH / 2.0)
-                    .w(Self::lane_x(to) - Self::lane_x(from) + LINE_WIDTH)
-                    .h(LINE_WIDTH)
-                    .bg(self.lane_color(color, cx)),
+                    .left(Self::lane_x(from))
+                    .top_0()
+                    .w(Self::lane_x(to) - Self::lane_x(from) + LINE_WIDTH / 2.0)
+                    .h(half_row + LINE_WIDTH / 2.0)
+                    .border_r(LINE_WIDTH)
+                    .border_b(LINE_WIDTH)
+                    .border_color(self.lane_color(color, cx))
+                    .rounded_br(ELBOW_RADIUS),
             };
             gutter = gutter.child(line);
         }
 
         let colors = cx.theme().colors();
         let accent = self.lane_color(row.column, cx);
-        if row.kind == RowKind::Terminator {
-            return gutter
-                .child(
-                    div()
-                        .absolute()
-                        .left(Self::lane_x(0) - LANE_WIDTH / 2.0)
-                        .top(half_row)
-                        .w(LANE_WIDTH)
-                        .flex()
-                        .justify_center()
-                        .child(Label::new("~").color(Color::Muted)),
-                )
-                .into_any_element();
+        if matches!(row.kind, RowKind::Terminator | RowKind::Link) {
+            return gutter.into_any_element();
         }
 
         let node = div()
@@ -593,10 +653,13 @@ impl Smartlog {
             .map(|node| match row.kind {
                 RowKind::Draft => node.border_color(accent).bg(accent),
                 RowKind::Public => node.border_color(accent).bg(colors.background),
-                RowKind::Uncommitted | RowKind::Terminator => node
+                RowKind::Uncommitted | RowKind::Terminator | RowKind::Link => node
                     .border_color(colors.text_muted)
                     .border_dashed()
                     .bg(colors.background),
+            })
+            .when(row.is_head, |node| {
+                node.border_color(cx.theme().status().info)
             });
         gutter.child(node).into_any_element()
     }
@@ -607,7 +670,7 @@ impl Smartlog {
         let sha = row.sha;
 
         let summary = match (row.kind, sha) {
-            (RowKind::Terminator, _) => h_flex(),
+            (RowKind::Terminator | RowKind::Link, _) => h_flex(),
             (RowKind::Uncommitted, _) | (_, None) => {
                 let count = self
                     .repository(cx)
@@ -622,8 +685,7 @@ impl Smartlog {
                     |commit| commit.subject.clone(),
                 );
                 let details = commit.map(|commit| {
-                    let author = commit.author_name.clone();
-                    let timestamp = OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
+                    OffsetDateTime::from_unix_timestamp(commit.commit_timestamp)
                         .map(|timestamp| {
                             time_format::format_local_timestamp(
                                 timestamp,
@@ -631,39 +693,17 @@ impl Smartlog {
                                 TimestampFormat::Relative,
                             )
                         })
-                        .unwrap_or_default();
-                    format!("{author} · {timestamp}")
+                        .unwrap_or_default()
                 });
 
-                v_flex()
+                h_flex()
+                    .gap_2()
                     .min_w_0()
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .min_w_0()
-                            .child(
-                                Label::new(subject)
-                                    .truncate()
-                                    .when(row.kind == RowKind::Public, |label| {
-                                        label.color(Color::Muted)
-                                    }),
-                            )
-                            .children(
-                                self.ref_names
-                                    .get(&sha)
-                                    .into_iter()
-                                    .flatten()
-                                    .filter(|name| !name.as_ref().starts_with("tag: "))
-                                    .map(|name| {
-                                        let name = name
-                                            .strip_prefix("HEAD -> ")
-                                            .unwrap_or(name.as_ref())
-                                            .to_string();
-                                        Chip::new(name).label_size(LabelSize::Small)
-                                    }),
-                            )
-                            .when(row.is_head, |this| {
-                                this.child(Chip::new("You are here").label_size(LabelSize::Small))
+                        Label::new(subject)
+                            .truncate()
+                            .when(row.kind == RowKind::Public, |label| {
+                                label.color(Color::Muted)
                             }),
                     )
                     .when_some(details, |this, details| {
@@ -671,7 +711,35 @@ impl Smartlog {
                             Label::new(details)
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
-                                .truncate(),
+                                .flex_none(),
+                        )
+                    })
+                    .children(
+                        self.ref_names
+                            .get(&sha)
+                            .into_iter()
+                            .flatten()
+                            .filter(|name| !name.as_ref().starts_with("tag: "))
+                            .map(|name| {
+                                let name = name
+                                    .strip_prefix("HEAD -> ")
+                                    .unwrap_or(name.as_ref())
+                                    .to_string();
+                                Chip::new(name).label_size(LabelSize::Small)
+                            }),
+                    )
+                    .when(row.is_head, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .rounded_full()
+                                .bg(cx.theme().status().info_border)
+                                .child(
+                                    Label::new("You are here")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Default),
+                                ),
                         )
                     })
             }
@@ -815,11 +883,17 @@ mod tests {
 
         assert_eq!(
             shas(&layout),
-            vec![(Some(b), 1), (Some(a), 1), (Some(trunk), 0), (None, 0)]
+            vec![
+                (Some(b), 1),
+                (Some(a), 1),
+                (None, 0),
+                (Some(trunk), 0),
+                (None, 0)
+            ]
         );
         assert!(layout.rows[0].is_head);
-        assert_eq!(layout.rows[2].kind, RowKind::Public);
-        assert_eq!(layout.edges.len(), 2);
+        assert_eq!(layout.rows[3].kind, RowKind::Public);
+        assert_eq!(layout.edges.len(), 3);
     }
 
     #[test]
@@ -899,14 +973,15 @@ mod tests {
             column: 1,
             color: 1
         }));
-        assert!(segments[1].contains(&Segment::Up {
-            column: 1,
-            color: 1
-        }));
-        assert!(segments[1].contains(&Segment::Horizontal {
+        assert_eq!(layout.rows[1].kind, RowKind::Link);
+        assert!(segments[1].contains(&Segment::Elbow {
             from: 0,
             to: 1,
             color: 1
+        }));
+        assert!(segments[2].contains(&Segment::Up {
+            column: 0,
+            color: 0
         }));
     }
 }
