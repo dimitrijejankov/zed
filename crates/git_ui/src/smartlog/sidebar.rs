@@ -516,7 +516,7 @@ impl Smartlog {
             .weight(gpui::FontWeight::BOLD)
     }
 
-    fn badge(&self, text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    pub(super) fn badge(&self, text: impl Into<SharedString>, cx: &App) -> AnyElement {
         div()
             .flex_none()
             .px_1p5()

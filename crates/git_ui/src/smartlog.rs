@@ -615,6 +615,17 @@ fn commit_matches_filter(
             .any(|name| name.to_lowercase().contains(filter))
 }
 
+/// What a shelved change is called in the list: the message git recorded, which for an
+/// unnamed stash is `WIP on <branch>: <hash> <subject>`.
+fn shelf_entry_label(message: &str) -> &str {
+    let message = message.trim();
+    if message.is_empty() {
+        "Shelved changes"
+    } else {
+        message
+    }
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
@@ -731,6 +742,7 @@ pub struct Smartlog {
     hidden_closure: HashSet<Oid>,
     protected_from_hiding: HashSet<Oid>,
     show_hidden: bool,
+    shelf_collapsed: bool,
     pending_selection: Option<Oid>,
     sidebar: SidebarState,
     uncommitted_files: Vec<StatusEntry>,
@@ -790,6 +802,7 @@ impl Smartlog {
                 | RepositoryEvent::HeadChanged
                 | RepositoryEvent::BranchListChanged
                 | RepositoryEvent::StatusesChanged => this.refresh(window, cx),
+                RepositoryEvent::StashEntriesChanged => cx.notify(),
                 _ => {}
             }
         })
@@ -815,6 +828,7 @@ impl Smartlog {
             hidden_closure: HashSet::default(),
             protected_from_hiding: HashSet::default(),
             show_hidden: false,
+            shelf_collapsed: false,
             pending_selection: None,
             sidebar,
             uncommitted_files: Vec::new(),
@@ -1007,6 +1021,163 @@ impl Smartlog {
         self.selection = selection;
         self.selection_anchor = anchor;
         self.sync_sidebar(window, cx);
+    }
+
+    fn shelve_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let selected = self.selected_paths();
+        if selected.is_empty() {
+            return;
+        }
+        let title = self.title_editor.read(cx).text(cx);
+        let title = title.trim();
+        let message = (!title.is_empty()).then(|| title.to_string());
+
+        let task = repository.update(cx, |repository, cx| {
+            repository.stash_entries(selected, message, cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            task.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.title_editor
+                    .update(cx, |editor, cx| editor.set_text("", window, cx));
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to shelve changes", window, cx, |_, _, _| None);
+    }
+
+    fn unshelve(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let task = repository.update(cx, |repository, cx| repository.stash_pop(Some(index), cx));
+        cx.spawn_in(window, async move |_, _| {
+            task.await?;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to unshelve changes", window, cx, |_, _, _| None);
+    }
+
+    fn delete_shelved(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Delete these shelved changes?",
+            Some("This can't be undone."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+            repository
+                .update(cx, |repository, cx| repository.stash_drop(Some(index), cx))
+                .await??;
+            Ok(())
+        })
+        .detach_and_prompt_err(
+            "Failed to delete shelved changes",
+            window,
+            cx,
+            |_, _, _| None,
+        );
+    }
+
+    fn render_shelved_changes(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let repository = self.repository(cx)?;
+        let entries = repository.read(cx).stash_entries.entries.clone();
+        if entries.is_empty() {
+            return None;
+        }
+        let collapsed = self.shelf_collapsed;
+
+        Some(
+            v_flex()
+                .mt_4()
+                .px_4()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            IconButton::new(
+                                "smartlog-toggle-shelf",
+                                if collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                },
+                            )
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.shelf_collapsed = !this.shelf_collapsed;
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            Label::new("SHELVED CHANGES")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .weight(gpui::FontWeight::BOLD),
+                        )
+                        .child(self.badge(entries.len().to_string(), cx)),
+                )
+                .when(!collapsed, |this| {
+                    this.children(entries.iter().map(|entry| {
+                        let index = entry.index;
+                        let timestamp = OffsetDateTime::from_unix_timestamp(entry.timestamp)
+                            .map(|timestamp| {
+                                time_format::format_local_timestamp(
+                                    timestamp,
+                                    OffsetDateTime::now_utc(),
+                                    TimestampFormat::Relative,
+                                )
+                            })
+                            .unwrap_or_default();
+                        h_flex()
+                            .h_8()
+                            .gap_2()
+                            .child(
+                                Label::new(shelf_entry_label(&entry.message).to_string())
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(timestamp)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .flex_none(),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new(("smartlog-unshelve", index), "Unshelve")
+                                    .style(ButtonStyle::Filled)
+                                    .size(ButtonSize::Compact)
+                                    .tooltip(Tooltip::text(
+                                        "Apply these changes to the working tree and remove the shelf",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.unshelve(index, window, cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(("smartlog-delete-shelf", index), IconName::Trash)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Delete shelved changes"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.delete_shelved(index, window, cx);
+                                    })),
+                            )
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     fn fold_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2115,6 +2286,19 @@ impl Smartlog {
                     }))
                     .child(self.title_editor.clone()),
             )
+            .child(
+                Button::new("smartlog-shelve", "Shelve")
+                    .start_icon(Icon::new(IconName::Archive).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .disabled(nothing_selected)
+                    .tooltip(Tooltip::text(
+                        "Save the selected changes for later and remove them from the working tree",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.shelve_selection(window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -2485,7 +2669,8 @@ impl Render for Smartlog {
                     .m_2(),
                 )
             })
-            .children(rows);
+            .children(rows)
+            .children(self.render_shelved_changes(cx));
 
         let body = h_flex()
             .id("smartlog-body")
@@ -2847,6 +3032,15 @@ mod tests {
         assert!(matches("feature/login"));
         assert!(!matches("unrelated"));
         assert!(!commit_matches_filter("parser", sha, None, None, &[]));
+    }
+
+    #[test]
+    fn an_unnamed_shelf_still_has_a_label() {
+        assert_eq!(shelf_entry_label("  "), "Shelved changes");
+        assert_eq!(
+            shelf_entry_label("WIP on main: abc1234 Fix it"),
+            "WIP on main: abc1234 Fix it"
+        );
     }
 
     #[test]
