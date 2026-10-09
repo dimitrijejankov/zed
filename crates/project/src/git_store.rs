@@ -40,10 +40,10 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
-        HIDDEN_COMMIT_REF_PREFIX, InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, HIDDEN_COMMIT_REF_PREFIX,
+        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
+        delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -9517,7 +9517,11 @@ impl Repository {
         })
     }
 
-    fn create_ref(&mut self, ref_name: String, commit: String) -> oneshot::Receiver<Result<()>> {
+    pub fn create_ref(
+        &mut self,
+        ref_name: String,
+        commit: String,
+    ) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
         let this = self.this.clone();
         self.send_job(

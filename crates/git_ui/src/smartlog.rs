@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use collections::{HashMap, HashSet};
-use editor::Editor;
+use editor::{Editor, EditorEvent};
 use git::{
     Oid,
     repository::{
@@ -9,10 +9,12 @@ use git::{
     },
 };
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, DefiniteLength, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, Pixels, PromptLevel, SharedString, Task, WeakEntity, Window, actions, div,
-    prelude::*, px,
+    Anchor, AnyElement, App, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, Pixels, Point,
+    PromptLevel, SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
+    div, prelude::*, px,
 };
+use menu::{Cancel, Confirm};
 use project::git_store::{
     CommitDataState, GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
     StatusEntry,
@@ -20,10 +22,13 @@ use project::git_store::{
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time_format::TimestampFormat;
-use ui::{Checkbox, Chip, IconButtonShape, ToggleState, Tooltip, prelude::*};
+use ui::{
+    Checkbox, Chip, ContextMenu, Headline, HeadlineSize, IconButtonShape, ToggleState, Tooltip,
+    prelude::*,
+};
 use util::ResultExt;
 use workspace::{
-    Workspace,
+    ModalView, Workspace,
     item::{Item, ItemEvent},
     notifications::DetachAndPromptErr as _,
 };
@@ -588,12 +593,128 @@ fn hidden_closure(
     }
 }
 
+/// Whether a commit matches the text typed into the filter, which is already lowercase. It
+/// looks at the subject, author, hash prefix and branch or tag names.
+fn commit_matches_filter(
+    filter: &str,
+    sha: Oid,
+    subject: Option<&str>,
+    author: Option<(&str, &str)>,
+    ref_names: &[SharedString],
+) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    subject.is_some_and(|subject| subject.to_lowercase().contains(filter))
+        || author.is_some_and(|(name, email)| {
+            name.to_lowercase().contains(filter) || email.to_lowercase().contains(filter)
+        })
+        || sha.to_string().starts_with(filter)
+        || ref_names
+            .iter()
+            .any(|name| name.to_lowercase().contains(filter))
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
 
+struct SmartlogContextMenu {
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _subscription: Subscription,
+}
+
+struct CreateBookmarkModal {
+    commit: Oid,
+    editor: Entity<Editor>,
+    repository: Entity<Repository>,
+}
+
+impl CreateBookmarkModal {
+    fn new(
+        commit: Oid,
+        repository: Entity<Repository>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Bookmark name", window, cx);
+            editor
+        });
+        Self {
+            commit,
+            editor,
+            repository,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.editor.read(cx).text(cx).trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let repository = self.repository.clone();
+        let commit = self.commit.to_string();
+        cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.create_ref(format!("refs/heads/{name}"), commit)
+                })
+                .await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to create bookmark", window, cx, |_, _, _| None);
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CreateBookmarkModal {}
+impl ModalView for CreateBookmarkModal {}
+
+impl Focusable for CreateBookmarkModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for CreateBookmarkModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("CreateBookmarkModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::Bookmark).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!(
+                            "Create Bookmark at {}",
+                            self.commit.display_short()
+                        ))
+                        .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
 pub struct Smartlog {
     focus_handle: FocusHandle,
+    context_menu: Option<SmartlogContextMenu>,
+    filter_editor: Entity<Editor>,
     git_store: Entity<GitStore>,
     workspace: WeakEntity<Workspace>,
     repository_id: RepositoryId,
@@ -645,6 +766,17 @@ impl Smartlog {
         });
 
         let sidebar = SidebarState::new(window, cx);
+        let filter_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Filter commits…", window, cx);
+            editor
+        });
+        cx.subscribe(&filter_editor, |_, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                cx.notify();
+            }
+        })
+        .detach();
 
         cx.subscribe_in(&git_store, window, |this, _, event, window, cx| {
             let GitStoreEvent::RepositoryUpdated(updated_id, event, _) = event else {
@@ -665,6 +797,8 @@ impl Smartlog {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
+            context_menu: None,
+            filter_editor,
             git_store,
             workspace,
             repository_id,
@@ -920,6 +1054,176 @@ impl Smartlog {
             Ok(())
         })
         .detach_and_prompt_err("Failed to fold commits", window, cx, |_, _, _| None);
+    }
+
+    fn filter_text(&self, cx: &App) -> String {
+        self.filter_editor.read(cx).text(cx).trim().to_lowercase()
+    }
+
+    fn matches_filter(&self, sha: Oid, filter: &str) -> bool {
+        let commit = self.commits.get(&sha);
+        commit_matches_filter(
+            filter,
+            sha,
+            commit.map(|commit| commit.subject.as_ref()),
+            commit.map(|commit| (commit.author_name.as_ref(), commit.author_email.as_ref())),
+            self.ref_names.get(&sha).map_or(&[], Vec::as_slice),
+        )
+    }
+
+    fn deploy_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        row_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.layout.rows.get(row_index).cloned() else {
+            return;
+        };
+        let Some(sha) = row.sha else {
+            return;
+        };
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        if !self.selection.contains(&sha) {
+            self.selection = HashSet::from_iter([sha]);
+            self.selection_anchor = Some(sha);
+            self.sync_sidebar(window, cx);
+        }
+
+        let is_head = row.is_head;
+        let is_draft = row.kind == RowKind::Draft;
+        let rebase_plan = if is_draft && !self.rebase_in_progress(cx) {
+            self.rebase_plan(sha, cx)
+        } else {
+            None
+        };
+        let can_hide = is_draft
+            && !self.protected_from_hiding.contains(&sha)
+            && !self.hidden_closure.contains(&sha);
+        let is_hidden_root = self.hidden.contains(&sha);
+        let trunk = self.trunk.clone();
+        let smartlog = cx.entity().downgrade();
+        let workspace = self.workspace.clone();
+        let focus_handle = self.focus_handle.clone();
+
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.context(focus_handle)
+                .header(format!("Commit {}", sha.display_short()))
+                .when(!is_head, |menu| {
+                    menu.entry("Goto", None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            smartlog
+                                .update(cx, |this, cx| this.goto_commit(sha, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+                .entry("Copy Hash", None, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
+                })
+                .entry("View Changes in Commit", None, {
+                    let smartlog = smartlog.clone();
+                    move |window, cx| {
+                        smartlog
+                            .update(cx, |this, cx| this.open_commit(sha, window, cx))
+                            .log_err();
+                    }
+                })
+                .separator()
+                .when_some(rebase_plan, |menu, plan| {
+                    menu.entry(format!("Rebase onto {trunk}"), None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            let plan = plan.clone();
+                            smartlog
+                                .update(cx, |this, cx| this.rebase_stack(plan, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+                .entry("Create Bookmark…", None, {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        let repository = repository.clone();
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.toggle_modal(window, cx, |window, cx| {
+                                    CreateBookmarkModal::new(sha, repository, window, cx)
+                                });
+                            })
+                            .log_err();
+                    }
+                })
+                .entry("Create Tag…", None, {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        let repository = repository.clone();
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                crate::create_tag_at_commit(
+                                    sha, is_head, repository, workspace, window, cx,
+                                );
+                            })
+                            .log_err();
+                    }
+                })
+                .when(
+                    can_hide || is_hidden_root || (is_head && is_draft),
+                    |menu| menu.separator(),
+                )
+                .when(can_hide, |menu| {
+                    menu.entry("Hide Commit and Descendants", None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            smartlog
+                                .update(cx, |this, cx| this.hide_commit(sha, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+                .when(is_hidden_root, |menu| {
+                    menu.entry("Show Commit", None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            smartlog
+                                .update(cx, |this, cx| this.unhide_commit(sha, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+                .when(is_head && is_draft, |menu| {
+                    menu.entry("Uncommit", None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            smartlog
+                                .update(cx, |this, cx| this.uncommit(window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+        });
+
+        window.focus(&menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+                if menu.focus_handle(cx).contains_focused(window, cx) {
+                    cx.focus_self(window);
+                }
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some(SmartlogContextMenu {
+            menu,
+            position,
+            _subscription: subscription,
+        });
+        cx.notify();
     }
 
     fn hide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
@@ -1862,6 +2166,8 @@ impl Smartlog {
         };
         let trunk_name = self.trunk.clone();
         let is_hidden = sha.is_some_and(|sha| self.hidden_closure.contains(&sha));
+        let filter = self.filter_text(cx);
+        let matches_filter = sha.is_none_or(|sha| self.matches_filter(sha, &filter));
         let is_hidden_root = sha.is_some_and(|sha| self.hidden.contains(&sha));
         let can_hide = row.kind == RowKind::Draft
             && sha.is_some_and(|sha| {
@@ -1930,6 +2236,13 @@ impl Smartlog {
         h_flex()
             .id(("smartlog-row", index))
             .when(is_hidden, |this| this.opacity(0.5))
+            .when(!matches_filter, |this| this.opacity(0.3))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_context_menu(event.position, index, window, cx);
+                }),
+            )
             .h(ROW_HEIGHT)
             .w_full()
             .group("smartlog-row")
@@ -2068,6 +2381,18 @@ impl Render for Smartlog {
             )
             .child(
                 h_flex()
+                    .h_7()
+                    .flex_1()
+                    .max_w(rems(20.))
+                    .px_2()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .rounded_md()
+                    .bg(cx.theme().colors().toolbar_background)
+                    .child(self.filter_editor.clone()),
+            )
+            .child(
+                h_flex()
                     .gap_2()
                     .when(!self.hidden.is_empty(), |this| {
                         this.child(
@@ -2106,6 +2431,14 @@ impl Render for Smartlog {
                     ),
             );
 
+        let filter = self.filter_text(cx);
+        let filter_matches_anything = filter.is_empty()
+            || self
+                .layout
+                .rows
+                .iter()
+                .filter_map(|row| row.sha)
+                .any(|sha| self.matches_filter(sha, &filter));
         let sidebar_open = !self.sidebar.collapsed;
         let list_fraction = self.sidebar.split.read(cx).visible_left_ratio();
 
@@ -2125,6 +2458,22 @@ impl Render for Smartlog {
             })
             .when_some(self.error.clone(), |this, error| {
                 this.child(Label::new(error).color(Color::Error).m_2())
+            })
+            .when(!filter_matches_anything, |this| {
+                this.child(
+                    v_flex()
+                        .m_2()
+                        .gap_2()
+                        .child(Label::new("No commits match your filter").color(Color::Muted))
+                        .child(
+                            Button::new("smartlog-clear-filter", "Clear filter")
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.filter_editor
+                                        .update(cx, |editor, cx| editor.set_text("", window, cx));
+                                })),
+                        ),
+                )
             })
             .when(rows.is_empty() && self.error.is_none(), |this| {
                 this.child(
@@ -2173,6 +2522,15 @@ impl Render for Smartlog {
                 this.child(self.render_rebase_banner(cx))
             })
             .child(body)
+            .children(self.context_menu.as_ref().map(|context_menu| {
+                deferred(
+                    anchored()
+                        .position(context_menu.position)
+                        .anchor(Anchor::TopLeft)
+                        .child(context_menu.menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 
@@ -2465,6 +2823,30 @@ mod tests {
         assert_eq!(fold_chain(&parents, &set(&[3, 5])), None);
         assert_eq!(fold_chain(&parents, &set(&[3])), None);
         assert_eq!(fold_chain(&parents, &set(&[2, 3, 5])), None);
+    }
+
+    #[test]
+    fn the_filter_matches_subject_author_hash_and_refs() {
+        let sha = oid(0xab);
+        let refs = [SharedString::from("HEAD -> Feature/Login")];
+        let matches = |filter: &str| {
+            commit_matches_filter(
+                filter,
+                sha,
+                Some("Fix the Parser"),
+                Some(("Ada Lovelace", "ada@example.com")),
+                &refs,
+            )
+        };
+
+        assert!(matches(""));
+        assert!(matches("parser"));
+        assert!(matches("lovelace"));
+        assert!(matches("ada@example"));
+        assert!(matches("abab"));
+        assert!(matches("feature/login"));
+        assert!(!matches("unrelated"));
+        assert!(!commit_matches_filter("parser", sha, None, None, &[]));
     }
 
     #[test]
