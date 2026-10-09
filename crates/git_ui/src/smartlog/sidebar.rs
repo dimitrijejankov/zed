@@ -348,7 +348,7 @@ impl Smartlog {
             return;
         }
 
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let new_sha = repository
                 .update(cx, |repository, _| {
                     repository.reword_commit(sha.to_string(), message)
@@ -361,8 +361,8 @@ impl Smartlog {
                 this.refresh(window, cx);
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err("Failed to amend commit message", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to amend commit message", task, window, cx);
     }
 
     fn sidebar_commit_message(&self, cx: &App) -> Option<SharedString> {
@@ -404,7 +404,7 @@ impl Smartlog {
         let askpass = self.askpass_delegate("git push", window, cx);
         let workspace = self.workspace.clone();
 
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             if let Some(commit_task) = commit_task {
                 commit_task.await?;
             }
@@ -440,8 +440,8 @@ impl Smartlog {
                 );
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err("Failed to submit", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to submit", task, window, cx);
     }
 
     fn open_all_changed_files(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -794,7 +794,7 @@ impl Smartlog {
                 .on_click(cx.listener(|this, _, window, cx| {
                     let message = this.sidebar_commit_message(cx);
                     if let Some(task) = this.commit_changes(false, message, window, cx) {
-                        task.detach_and_prompt_err("Failed to commit", window, cx, |_, _, _| None);
+                        this.run_logged("Failed to commit", task, window, cx);
                     }
                 })),
             PrimaryAction::Amend => Button::new("smartlog-sidebar-amend", "Amend")
@@ -813,12 +813,7 @@ impl Smartlog {
                         None
                     };
                     if let Some(task) = this.commit_changes(true, message, window, cx) {
-                        task.detach_and_prompt_err(
-                            "Failed to amend commit",
-                            window,
-                            cx,
-                            |_, _, _| None,
-                        );
+                        this.run_logged("Failed to amend commit", task, window, cx);
                     }
                 })),
             PrimaryAction::AmendMessage => {

@@ -19,12 +19,12 @@ use project::git_store::{
     CommitDataState, GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
     StatusEntry,
 };
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 use time::OffsetDateTime;
 use time_format::TimestampFormat;
 use ui::{
-    Checkbox, Chip, ContextMenu, Headline, HeadlineSize, IconButtonShape, ToggleState, Tooltip,
-    prelude::*,
+    Checkbox, Chip, CommonAnimationExt as _, ContextMenu, Headline, HeadlineSize, IconButtonShape,
+    ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt;
 use workspace::{
@@ -754,6 +754,33 @@ fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
 
+const MAX_OPERATION_HISTORY: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+struct OperationRecord {
+    id: u64,
+    name: SharedString,
+    state: OperationState,
+}
+
+/// Turns a failure title such as `Failed to rebase` into the name shown in the history, `Rebase`.
+fn operation_name(failure_title: &str) -> String {
+    let name = failure_title
+        .strip_prefix("Failed to ")
+        .unwrap_or(failure_title);
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
 struct SmartlogContextMenu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
@@ -867,6 +894,9 @@ pub struct Smartlog {
     protected_from_hiding: HashSet<Oid>,
     show_hidden: bool,
     shelf_collapsed: bool,
+    operations: VecDeque<OperationRecord>,
+    next_operation_id: u64,
+    history_expanded: bool,
     pending_selection: Option<Oid>,
     sidebar: SidebarState,
     uncommitted_files: Vec<StatusEntry>,
@@ -953,6 +983,9 @@ impl Smartlog {
             protected_from_hiding: HashSet::default(),
             show_hidden: false,
             shelf_collapsed: false,
+            operations: VecDeque::new(),
+            next_operation_id: 0,
+            history_expanded: false,
             pending_selection: None,
             sidebar,
             uncommitted_files: Vec::new(),
@@ -1093,15 +1126,15 @@ impl Smartlog {
         let Some(repository) = self.repository(cx) else {
             return;
         };
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             repository
                 .update(cx, |repository, _| {
                     repository.change_branch(sha.to_string())
                 })
                 .await??;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err("Failed to go to commit", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to go to commit", task, window, cx);
     }
 
     fn selectable_rows(&self) -> Vec<SelectableRow> {
@@ -1162,15 +1195,15 @@ impl Smartlog {
         let task = repository.update(cx, |repository, cx| {
             repository.stash_entries(selected, message, cx)
         });
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             task.await?;
             this.update_in(cx, |this, window, cx| {
                 this.title_editor
                     .update(cx, |editor, cx| editor.set_text("", window, cx));
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err("Failed to shelve changes", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to shelve changes", task, window, cx);
     }
 
     fn unshelve(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1178,11 +1211,11 @@ impl Smartlog {
             return;
         };
         let task = repository.update(cx, |repository, cx| repository.stash_pop(Some(index), cx));
-        cx.spawn_in(window, async move |_, _| {
+        let task = cx.spawn_in(window, async move |_, _| {
             task.await?;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err("Failed to unshelve changes", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to unshelve changes", task, window, cx);
     }
 
     fn delete_shelved(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1196,7 +1229,7 @@ impl Smartlog {
             &["Delete", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             if prompt.await? != 0 {
                 return anyhow::Ok(());
             }
@@ -1204,13 +1237,8 @@ impl Smartlog {
                 .update(cx, |repository, cx| repository.stash_drop(Some(index), cx))
                 .await??;
             Ok(())
-        })
-        .detach_and_prompt_err(
-            "Failed to delete shelved changes",
-            window,
-            cx,
-            |_, _, _| None,
-        );
+        });
+        self.run_logged("Failed to delete shelved changes", task, window, cx);
     }
 
     fn render_shelved_changes(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1333,7 +1361,7 @@ impl Smartlog {
             &["Fold", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             if prompt.await? != 0 {
                 return anyhow::Ok(());
             }
@@ -1347,8 +1375,8 @@ impl Smartlog {
                 this.refresh(window, cx);
             })?;
             Ok(())
-        })
-        .detach_and_prompt_err("Failed to fold commits", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to fold commits", task, window, cx);
     }
 
     fn filter_text(&self, cx: &App) -> String {
@@ -1532,7 +1560,7 @@ impl Smartlog {
             &["Hide", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             if prompt.await? != 0 {
                 return anyhow::Ok(());
             }
@@ -1542,23 +1570,23 @@ impl Smartlog {
                 })
                 .await??;
             Ok(())
-        })
-        .detach_and_prompt_err("Failed to hide commit", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to hide commit", task, window, cx);
     }
 
     fn unhide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.repository(cx) else {
             return;
         };
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             repository
                 .update(cx, |repository, _| {
                     repository.set_commit_hidden(sha.to_string(), false)
                 })
                 .await??;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err("Failed to show commit", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to show commit", task, window, cx);
     }
 
     fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
@@ -1608,7 +1636,7 @@ impl Smartlog {
             return;
         };
         let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             let result = repository
                 .update(cx, |repository, cx| operation(repository, cx))
                 .await?;
@@ -1627,8 +1655,8 @@ impl Smartlog {
                 }
                 other => other,
             }
-        })
-        .detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+        });
+        self.run_logged(failure_title, task, window, cx);
     }
 
     fn rebase_stack(&mut self, plan: RebasePlan, window: &mut Window, cx: &mut Context<Self>) {
@@ -1678,7 +1706,7 @@ impl Smartlog {
         } else {
             None
         };
-        cx.spawn_in(window, async move |this, cx| {
+        let task = cx.spawn_in(window, async move |this, cx| {
             let sha = repository
                 .update(cx, |repository, _| {
                     repository.commit_before_time(trunk.clone(), unix_timestamp)
@@ -1702,8 +1730,8 @@ impl Smartlog {
                 }
             }
             Ok(())
-        })
-        .detach_and_prompt_err("Failed to go to that time", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to go to that time", task, window, cx);
     }
 
     fn continue_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1933,6 +1961,119 @@ impl Smartlog {
             .into_any_element()
     }
 
+    /// Runs `task`, records it in the command history, and reports a failure to the user.
+    fn run_logged(
+        &mut self,
+        failure_title: &'static str,
+        task: Task<anyhow::Result<()>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_operation_id;
+        self.next_operation_id += 1;
+        self.operations.push_front(OperationRecord {
+            id,
+            name: operation_name(failure_title).into(),
+            state: OperationState::Running,
+        });
+        self.operations.truncate(MAX_OPERATION_HISTORY);
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let state = if result.is_ok() {
+                OperationState::Succeeded
+            } else {
+                OperationState::Failed
+            };
+            this.update(cx, |this, cx| {
+                if let Some(record) = this.operations.iter_mut().find(|record| record.id == id) {
+                    record.state = state;
+                }
+                cx.notify();
+            })
+            .log_err();
+            result
+        })
+        .detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+    }
+
+    fn operation_icon(state: OperationState) -> AnyElement {
+        match state {
+            OperationState::Running => Icon::new(IconName::ArrowCircle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .with_rotate_animation(2)
+                .into_any_element(),
+            OperationState::Succeeded => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+            OperationState::Failed => Icon::new(IconName::XCircle)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+        }
+    }
+
+    fn render_operation_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let latest = self.operations.front()?;
+        let colors = cx.theme().colors();
+        let expanded = self.history_expanded;
+
+        Some(
+            v_flex()
+                .flex_none()
+                .w_full()
+                .border_t_1()
+                .border_color(colors.border_variant)
+                .when(expanded, |this| {
+                    this.child(v_flex().px_4().py_1().gap_1().children(
+                        self.operations.iter().skip(1).map(|record| {
+                            h_flex()
+                                .gap_2()
+                                .child(Self::operation_icon(record.state))
+                                .child(
+                                    Label::new(record.name.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                        }),
+                    ))
+                })
+                .child(
+                    h_flex()
+                        .id("smartlog-operation-strip")
+                        .px_4()
+                        .py_1p5()
+                        .gap_2()
+                        .justify_between()
+                        .cursor_pointer()
+                        .hover(|this| this.bg(colors.element_hover))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.history_expanded = !this.history_expanded;
+                            cx.notify();
+                        }))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Self::operation_icon(latest.state))
+                                .child(Label::new(latest.name.clone())),
+                        )
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronUp
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn selected_paths(&self) -> Vec<RepoPath> {
         self.uncommitted_files
             .iter()
@@ -2091,7 +2232,7 @@ impl Smartlog {
             "Failed to commit"
         };
         if let Some(task) = self.commit_changes(amend, None, window, cx) {
-            task.detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+            self.run_logged(failure_title, task, window, cx);
         }
     }
 
@@ -2162,7 +2303,7 @@ impl Smartlog {
         );
         let workspace = self.workspace.clone();
 
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             if prompt.await? != 0 {
                 return anyhow::Ok(());
             }
@@ -2218,8 +2359,8 @@ impl Smartlog {
                 }
             }
             Ok(())
-        })
-        .detach_and_prompt_err("Failed to discard changes", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to discard changes", task, window, cx);
     }
 
     fn uncommit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2233,7 +2374,7 @@ impl Smartlog {
             &["Uncommit", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |_, cx| {
+        let task = cx.spawn_in(window, async move |_, cx| {
             if prompt.await? != 0 {
                 return anyhow::Ok(());
             }
@@ -2243,8 +2384,8 @@ impl Smartlog {
                 })
                 .await??;
             Ok(())
-        })
-        .detach_and_prompt_err("Failed to uncommit", window, cx, |_, _, _| None);
+        });
+        self.run_logged("Failed to uncommit", task, window, cx);
     }
 
     fn open_file_diff(&self, entry: &StatusEntry, window: &mut Window, cx: &mut Context<Self>) {
@@ -2914,6 +3055,7 @@ impl Render for Smartlog {
                 this.child(self.render_rebase_banner(cx))
             })
             .child(body)
+            .children(self.render_operation_strip(cx))
             .children(self.context_menu.as_ref().map(|context_menu| {
                 deferred(
                     anchored()
@@ -3277,6 +3419,14 @@ mod tests {
     }
 
     #[test]
+    fn operation_names_come_from_the_failure_title() {
+        assert_eq!(operation_name("Failed to rebase"), "Rebase");
+        assert_eq!(operation_name("Failed to go to commit"), "Go to commit");
+        assert_eq!(operation_name("Uncommit"), "Uncommit");
+        assert_eq!(operation_name(""), "");
+    }
+
+    #[test]
     fn conflict_output_is_recognised() {
         assert!(stopped_on_conflicts(&anyhow::anyhow!(
             "CONFLICT (content): Merge conflict in a.txt\nerror: could not apply abc"
@@ -3547,6 +3697,84 @@ mod tests {
 
         workspace.read_with(&*cx, |workspace, cx| {
             assert!(workspace.active_item_as::<SoloDiffView>(cx).is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn operations_are_recorded_with_their_outcome(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use project::Project;
+        use serde_json::json;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {}, "a.txt": "a" }))
+            .await;
+        fs.set_head_and_index_for_repo(Path::new("/project/.git"), &[("a.txt", "a".to_string())]);
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace,
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.run_logged("Failed to do a thing", Task::ready(Ok(())), window, cx);
+            smartlog.run_logged(
+                "Failed to do another thing",
+                Task::ready(Err(anyhow::anyhow!("nope"))),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        smartlog.read_with(&*cx, |smartlog, _| {
+            let recorded: Vec<(String, OperationState)> = smartlog
+                .operations
+                .iter()
+                .map(|record| (record.name.to_string(), record.state))
+                .collect();
+            assert_eq!(
+                recorded,
+                vec![
+                    ("Do another thing".to_string(), OperationState::Failed),
+                    ("Do a thing".to_string(), OperationState::Succeeded),
+                ]
+            );
+        });
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            for _ in 0..MAX_OPERATION_HISTORY + 5 {
+                smartlog.run_logged("Failed to repeat", Task::ready(Ok(())), window, cx);
+            }
+        });
+        cx.run_until_parked();
+        smartlog.read_with(&*cx, |smartlog, _| {
+            assert_eq!(smartlog.operations.len(), MAX_OPERATION_HISTORY);
         });
     }
 }
