@@ -614,15 +614,18 @@ impl Smartlog {
         let Some(repository) = self.repository(cx) else {
             return;
         };
-        CommitView::open(
-            sha.to_string(),
-            repository.downgrade(),
-            self.workspace.clone(),
-            None,
-            None,
-            window,
-            cx,
-        );
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            CommitView::open(
+                sha.to_string(),
+                repository.downgrade(),
+                workspace,
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
     }
 
     fn lane_color(&self, lane: usize, cx: &App) -> Hsla {
@@ -1083,8 +1086,11 @@ impl Smartlog {
             staging: entry.status.staging(),
             diff_stat: entry.diff_stat,
         };
-        SoloDiffView::open_or_focus(entry, repository, self.workspace.clone(), window, cx)
-            .detach_and_prompt_err("Failed to open diff", window, cx, |_, _, _| None);
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            SoloDiffView::open_or_focus(entry, repository, workspace, window, cx)
+                .detach_and_prompt_err("Failed to open diff", window, cx, |_, _, _| None);
+        });
     }
 
     fn open_file(&self, path: &RepoPath, window: &mut Window, cx: &mut Context<Self>) {
@@ -1094,15 +1100,17 @@ impl Smartlog {
         else {
             return;
         };
-        let task = self
-            .workspace
-            .update(cx, |workspace, cx| {
-                workspace.open_path(project_path, None, true, window, cx)
-            })
-            .log_err();
-        if let Some(task) = task {
-            task.detach_and_prompt_err("Failed to open file", window, cx, |_, _, _| None);
-        }
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            let task = workspace
+                .update(cx, |workspace, cx| {
+                    workspace.open_path(project_path, None, true, window, cx)
+                })
+                .log_err();
+            if let Some(task) = task {
+                task.detach_and_prompt_err("Failed to open file", window, cx, |_, _, _| None);
+            }
+        });
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1899,6 +1907,81 @@ mod tests {
             smartlog.deselect_all(cx);
             smartlog.select_all(cx);
             assert!(smartlog.deselected.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn opening_a_diff_does_not_update_the_smartlog_while_it_is_updating(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fs::FakeFs;
+        use project::Project;
+        use serde_json::json;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "a.txt": "changed" }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("a.txt", "original".to_string())],
+            oid(7).to_string(),
+        );
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(smartlog.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let entry = smartlog.read_with(&*cx, |smartlog, _| smartlog.uncommitted_files[0].clone());
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.open_file_diff(&entry, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&smartlog, true, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.open_file_diff(&entry, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&*cx, |workspace, cx| {
+            assert!(workspace.active_item_as::<SoloDiffView>(cx).is_some());
         });
     }
 }
