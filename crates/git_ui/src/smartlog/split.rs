@@ -1,15 +1,81 @@
 use super::*;
 use project::git_store::CommitDiff;
 
-pub(super) struct SplitFile {
-    pub(super) path: RepoPath,
-    pub(super) status: git::status::FileStatus,
+pub(super) struct SplitHunk {
+    pub(super) index: u32,
+    pub(super) header: String,
+    pub(super) body: String,
     pub(super) in_first: bool,
 }
 
-/// A split needs files on both sides, otherwise one of the commits would be empty.
+pub(super) struct SplitFile {
+    pub(super) path: RepoPath,
+    pub(super) status: git::status::FileStatus,
+    /// Only used for a file without `hunks`, which moves as a whole.
+    pub(super) in_first: bool,
+    pub(super) hunks: Vec<SplitHunk>,
+    pub(super) expanded: bool,
+}
+
+impl SplitFile {
+    fn units(&self) -> (usize, usize) {
+        if self.hunks.is_empty() {
+            (usize::from(self.in_first), 1)
+        } else {
+            (
+                self.hunks.iter().filter(|hunk| hunk.in_first).count(),
+                self.hunks.len(),
+            )
+        }
+    }
+
+    fn toggle_state(&self) -> ToggleState {
+        match self.units() {
+            (0, _) => ToggleState::Unselected,
+            (first, total) if first == total => ToggleState::Selected,
+            _ => ToggleState::Indeterminate,
+        }
+    }
+
+    fn set_all(&mut self, in_first: bool) {
+        self.in_first = in_first;
+        for hunk in &mut self.hunks {
+            hunk.in_first = in_first;
+        }
+    }
+}
+
+/// A split needs changes on both sides, otherwise one of the commits would be empty.
 pub(super) fn can_split(files: &[SplitFile]) -> bool {
-    files.iter().any(|file| file.in_first) && files.iter().any(|file| !file.in_first)
+    let (first, total) = files.iter().fold((0, 0), |(first, total), file| {
+        let (file_first, file_total) = file.units();
+        (first + file_first, total + file_total)
+    });
+    first > 0 && first < total
+}
+
+/// Splits the choices into whole files and, for files only partly in the first commit, the hunks.
+pub(super) fn first_commit_selection(
+    files: &[SplitFile],
+) -> (Vec<RepoPath>, Vec<git::repository::HunkSelection>) {
+    let mut paths = Vec::new();
+    let mut selections = Vec::new();
+    for file in files {
+        match file.units() {
+            (0, _) => {}
+            (first, total) if first == total => paths.push(file.path.clone()),
+            _ => selections.push(git::repository::HunkSelection {
+                path: file.path.clone(),
+                hunks: file
+                    .hunks
+                    .iter()
+                    .filter(|hunk| hunk.in_first)
+                    .map(|hunk| hunk.index)
+                    .collect(),
+            }),
+        }
+    }
+    (paths, selections)
 }
 
 /// The messages of the two commits: each gets its own title, and the second keeps the original
@@ -67,12 +133,25 @@ impl SplitModal {
         let diff_task = repository.update(cx, |repository, cx| {
             repository.load_commit_diff(sha.to_string(), false, cx)
         });
+        let hunks_task =
+            repository.update(cx, |repository, _| repository.commit_hunks(sha.to_string()));
         let load_task = cx.spawn(async move |this, cx| {
             let Some(diff) = diff_task.await.log_err() else {
                 return;
             };
+            let hunks = match hunks_task.await {
+                Ok(Ok(hunks)) => hunks,
+                Ok(Err(error)) => {
+                    log::error!("Failed to list the hunks of the commit: {error:#}");
+                    Vec::new()
+                }
+                Err(error) => {
+                    log::error!("Failed to list the hunks of the commit: {error:#}");
+                    Vec::new()
+                }
+            };
             this.update(cx, |this, cx| {
-                this.files = Some(files_of(&diff, cx));
+                this.files = Some(files_of(&diff, hunks, cx));
                 cx.notify();
             })
             .log_err();
@@ -97,11 +176,7 @@ impl SplitModal {
         if !can_split(files) {
             return;
         }
-        let first_paths: Vec<RepoPath> = files
-            .iter()
-            .filter(|file| file.in_first)
-            .map(|file| file.path.clone())
-            .collect();
+        let (first_paths, first_hunks) = first_commit_selection(files);
         let (first_message, second_message) = split_messages(
             &self.first_title.read(cx).text(cx),
             &self.second_title.read(cx).text(cx),
@@ -113,23 +188,50 @@ impl SplitModal {
         let sha = self.sha;
         self.smartlog
             .update(cx, |smartlog, cx| {
-                smartlog.apply_split(sha, first_paths, first_message, second_message, window, cx);
+                smartlog.apply_split(
+                    sha,
+                    first_paths,
+                    first_hunks,
+                    first_message,
+                    second_message,
+                    window,
+                    cx,
+                );
             })
             .log_err();
         cx.emit(DismissEvent);
     }
 }
 
-fn files_of(diff: &CommitDiff, cx: &App) -> Vec<SplitFile> {
-    diff.files
+fn files_of(
+    diff: &CommitDiff,
+    hunks: Vec<git::repository::CommitHunk>,
+    cx: &App,
+) -> Vec<SplitFile> {
+    let mut files: Vec<SplitFile> = diff
+        .files
         .iter()
-        .enumerate()
-        .map(|(index, file)| SplitFile {
+        .map(|file| SplitFile {
             path: file.path.clone(),
             status: crate::git_graph::ChangedFileEntry::from_commit_file(file, cx).status,
-            in_first: index == 0,
+            in_first: false,
+            hunks: hunks
+                .iter()
+                .filter(|hunk| hunk.path == file.path)
+                .map(|hunk| SplitHunk {
+                    index: hunk.index,
+                    header: hunk.header.clone(),
+                    body: hunk.body.clone(),
+                    in_first: false,
+                })
+                .collect(),
+            expanded: false,
         })
-        .collect()
+        .collect();
+    if let Some(first) = files.first_mut() {
+        first.set_all(true);
+    }
+    files
 }
 
 impl EventEmitter<DismissEvent> for SplitModal {}
@@ -157,51 +259,122 @@ impl Render for SplitModal {
                 .child(editor.clone())
         };
 
-        let file_rows: Vec<AnyElement> = self
-            .files
-            .iter()
-            .flatten()
-            .enumerate()
-            .map(|(index, file)| {
+        let mut file_rows: Vec<AnyElement> = Vec::new();
+        for (index, file) in self.files.iter().flatten().enumerate() {
+            let has_hunks = !file.hunks.is_empty();
+            let (first_units, total_units) = file.units();
+            file_rows.push(
                 h_flex()
                     .h_8()
                     .gap_2()
                     .px_3()
-                    .child(
-                        Checkbox::new(
-                            ("smartlog-split-file", index),
-                            if file.in_first {
-                                ToggleState::Selected
+                    .child(if has_hunks {
+                        IconButton::new(
+                            ("smartlog-split-expand", index),
+                            if file.expanded {
+                                IconName::ChevronDown
                             } else {
-                                ToggleState::Unselected
+                                IconName::ChevronRight
                             },
                         )
-                        .on_click(cx.listener(
-                            move |this, state: &ToggleState, _, cx| {
+                        .icon_size(IconSize::Small)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(file) =
+                                this.files.as_mut().and_then(|files| files.get_mut(index))
+                            {
+                                file.expanded = !file.expanded;
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                    } else {
+                        div().size_6().into_any_element()
+                    })
+                    .child(
+                        Checkbox::new(("smartlog-split-file", index), file.toggle_state())
+                            .on_click(cx.listener(move |this, state: &ToggleState, _, cx| {
                                 if let Some(file) =
                                     this.files.as_mut().and_then(|files| files.get_mut(index))
                                 {
-                                    file.in_first = *state == ToggleState::Selected;
+                                    file.set_all(*state == ToggleState::Selected);
                                 }
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     )
                     .child(crate::git_status_icon(file.status))
                     .child(Label::new(file.path.as_unix_str().to_string()).truncate())
                     .child(div().flex_1())
                     .child(
-                        Label::new(if file.in_first {
-                            "First commit"
-                        } else {
-                            "Second commit"
-                        })
+                        Label::new(
+                            if has_hunks && first_units > 0 && first_units < total_units {
+                                format!("{first_units} of {total_units} hunks in the first commit")
+                            } else if first_units > 0 {
+                                "First commit".to_string()
+                            } else {
+                                "Second commit".to_string()
+                            },
+                        )
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                     )
-                    .into_any_element()
-            })
-            .collect();
+                    .into_any_element(),
+            );
+            if !file.expanded {
+                continue;
+            }
+            for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                file_rows.push(
+                    v_flex()
+                        .pl_12()
+                        .pr_3()
+                        .py_1()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Checkbox::new(
+                                        ("smartlog-split-hunk", index * 10_000 + hunk_index),
+                                        if hunk.in_first {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, state: &ToggleState, _, cx| {
+                                            if let Some(hunk) = this
+                                                .files
+                                                .as_mut()
+                                                .and_then(|files| files.get_mut(index))
+                                                .and_then(|file| file.hunks.get_mut(hunk_index))
+                                            {
+                                                hunk.in_first = *state == ToggleState::Selected;
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    Label::new(hunk.header.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                        .child(
+                            div().pl_6().child(
+                                Label::new(
+                                    hunk.body.lines().take(6).collect::<Vec<_>>().join("\n"),
+                                )
+                                .size(LabelSize::XSmall)
+                                .buffer_font(cx),
+                            ),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
 
         v_flex()
             .key_context("SmartlogSplit")
@@ -229,7 +402,7 @@ impl Render for SplitModal {
                     .pb_2()
                     .gap_1()
                     .child(
-                        Label::new("Tick the files that belong in the first commit.")
+                        Label::new("Tick the files, or expand one to tick single hunks, for the first commit.")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -272,7 +445,7 @@ impl Render for SplitModal {
                             .tooltip(Tooltip::text(if can_apply {
                                 "Split this commit into two"
                             } else {
-                                "Put at least one file in each commit"
+                                "Put at least one change in each commit"
                             }))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.apply(window, cx);
@@ -291,6 +464,24 @@ mod tests {
             path: git::repository::repo_path(name),
             status: git::status::FileStatus::Untracked,
             in_first,
+            hunks: Vec::new(),
+            expanded: false,
+        }
+    }
+
+    fn hunked_file(name: &str, hunks: &[bool]) -> SplitFile {
+        SplitFile {
+            hunks: hunks
+                .iter()
+                .enumerate()
+                .map(|(index, in_first)| SplitHunk {
+                    index: index as u32,
+                    header: String::new(),
+                    body: String::new(),
+                    in_first: *in_first,
+                })
+                .collect(),
+            ..file(name, false)
         }
     }
 
@@ -300,6 +491,28 @@ mod tests {
         assert!(!can_split(&[file("a", true), file("b", true)]));
         assert!(!can_split(&[file("a", false)]));
         assert!(!can_split(&[]));
+    }
+
+    #[test]
+    fn hunks_of_one_file_can_be_split_between_the_commits() {
+        let files = [hunked_file("a", &[true, false])];
+        assert!(can_split(&files));
+        assert_eq!(files[0].toggle_state(), ToggleState::Indeterminate);
+        let (paths, selections) = first_commit_selection(&files);
+        assert!(paths.is_empty());
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].hunks, vec![0]);
+
+        let all = [hunked_file("a", &[true, true])];
+        assert!(!can_split(&all));
+        assert_eq!(first_commit_selection(&all).0.len(), 1);
+        assert!(first_commit_selection(&all).1.is_empty());
+
+        let mixed = [hunked_file("a", &[false, false]), file("b", true)];
+        assert!(can_split(&mixed));
+        let (paths, selections) = first_commit_selection(&mixed);
+        assert_eq!(paths.len(), 1);
+        assert!(selections.is_empty());
     }
 
     #[test]

@@ -57,6 +57,22 @@ static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 /// %H - Full commit hash
 static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 
+/// One hunk of the change a commit made to a file, numbered in the order git lists them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitHunk {
+    pub path: RepoPath,
+    pub index: u32,
+    pub header: String,
+    pub body: String,
+}
+
+/// The hunks of `path` that belong in the first commit of a split.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HunkSelection {
+    pub path: RepoPath,
+    pub hunks: Vec<u32>,
+}
+
 /// A change in the working tree that could be folded into an earlier commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbsorbHunk {
@@ -1278,9 +1294,14 @@ pub trait GitRepository: Send + Sync {
         &self,
         sha: String,
         first_paths: Vec<RepoPath>,
+        first_hunks: Vec<HunkSelection>,
         first_message: String,
         second_message: String,
     ) -> BoxFuture<'_, Result<String>>;
+
+    /// The hunks `sha` changed, for the files that can be split hunk by hunk. Files that were
+    /// created, deleted, renamed or are binary only appear in a split as a whole.
+    fn commit_hunks(&self, sha: String) -> BoxFuture<'_, Result<Vec<CommitHunk>>>;
 
     /// Works out which commit of `base..HEAD` last touched the lines each uncommitted change
     /// edits. With `apply`, folds every change that has a single such commit into it.
@@ -3110,6 +3131,7 @@ impl GitRepository for RealGitRepository {
         &self,
         sha: String,
         first_paths: Vec<RepoPath>,
+        first_hunks: Vec<HunkSelection>,
         first_message: String,
         second_message: String,
     ) -> BoxFuture<'_, Result<String>> {
@@ -3121,11 +3143,19 @@ impl GitRepository for RealGitRepository {
                     &mut git,
                     &sha,
                     &first_paths,
+                    &first_hunks,
                     &first_message,
                     &second_message,
                 )
                 .await
             })
+            .boxed()
+    }
+
+    fn commit_hunks(&self, sha: String) -> BoxFuture<'_, Result<Vec<CommitHunk>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move { commit_hunks_with_git(&git, &sha).await })
             .boxed()
     }
 
@@ -4582,10 +4612,55 @@ async fn merge_trees(
     }
 }
 
+async fn commit_diff_files(git: &GitBinary, parent: &str, target: &str) -> Result<Vec<DiffFile>> {
+    let diff = git
+        .run_raw(&[
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            parent,
+            target,
+        ])
+        .await?;
+    Ok(parse_zero_context_diff(&diff))
+}
+
+async fn commit_hunks_with_git(git: &GitBinary, sha: &str) -> Result<Vec<CommitHunk>> {
+    let target = git
+        .run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+        .await?;
+    let Ok(parent) = git
+        .run(&["rev-parse", "--verify", &format!("{target}^")])
+        .await
+    else {
+        return Ok(Vec::new());
+    };
+    let mut hunks = Vec::new();
+    for file in commit_diff_files(git, &parent, &target).await? {
+        let path = RepoPath::new(&file.path)?;
+        for (index, hunk) in file.hunks.iter().enumerate() {
+            let (header, body) = hunk
+                .text
+                .split_once('\n')
+                .unwrap_or((hunk.text.as_str(), ""));
+            hunks.push(CommitHunk {
+                path: path.clone(),
+                index: index as u32,
+                header: header.to_string(),
+                body: body.to_string(),
+            });
+        }
+    }
+    Ok(hunks)
+}
+
 async fn split_commit_with_git(
     git: &mut GitBinary,
     sha: &str,
     first_paths: &[RepoPath],
+    first_hunks: &[HunkSelection],
     first_message: &str,
     second_message: &str,
 ) -> Result<String> {
@@ -4604,9 +4679,42 @@ async fn split_commit_with_git(
         - 1;
     anyhow::ensure!(parent_count == 1, "A merge commit can't be split");
     anyhow::ensure!(
-        !first_paths.is_empty(),
-        "The first commit needs at least one file"
+        !first_paths.is_empty()
+            || first_hunks
+                .iter()
+                .any(|selection| !selection.hunks.is_empty()),
+        "The first commit needs at least one change"
     );
+
+    let mut hunk_patch = String::new();
+    if first_hunks
+        .iter()
+        .any(|selection| !selection.hunks.is_empty())
+    {
+        let files = commit_diff_files(git, &parent, &target).await?;
+        for selection in first_hunks {
+            if selection.hunks.is_empty() || first_paths.contains(&selection.path) {
+                continue;
+            }
+            let file = files
+                .iter()
+                .find(|file| file.path == selection.path.as_unix_str())
+                .with_context(|| {
+                    format!(
+                        "{} can only be split as a whole file",
+                        selection.path.as_unix_str()
+                    )
+                })?;
+            hunk_patch.push_str(&file.header);
+            for index in &selection.hunks {
+                let hunk = file
+                    .hunks
+                    .get(*index as usize)
+                    .with_context(|| format!("{} has no hunk {index}", file.path))?;
+                hunk_patch.push_str(&hunk.text);
+            }
+        }
+    }
 
     let parent_tree = tree_of(git, &parent).await?;
     let first_tree = git
@@ -4632,9 +4740,31 @@ async fn split_commit_with_git(
                     }
                 }
             }
+            if !hunk_patch.is_empty() {
+                let patch_path = git
+                    .git_directory
+                    .join(format!("split-{}.patch", Uuid::new_v4()));
+                smol::fs::write(&patch_path, &hunk_patch).await?;
+                let patch_argument = patch_path.to_string_lossy().to_string();
+                let applied = git
+                    .run(&[
+                        "apply",
+                        "--cached",
+                        "--unidiff-zero",
+                        "--recount",
+                        &patch_argument,
+                    ])
+                    .await;
+                smol::fs::remove_file(&patch_path).await.log_err();
+                applied?;
+            }
             git.run(&["write-tree"]).await
         })
         .await?;
+    anyhow::ensure!(
+        first_tree != parent_tree,
+        "The first commit would be empty, so there is nothing to split"
+    );
     anyhow::ensure!(
         first_tree != tree_of(git, &target).await?,
         "The first commit would contain every change, so there is nothing to split"
@@ -9044,6 +9174,7 @@ mod tests {
             .split_commit(
                 both,
                 vec![repo_path("a.txt")],
+                vec![],
                 "add a".to_string(),
                 "add b".to_string(),
             )
@@ -9091,6 +9222,7 @@ mod tests {
             .split_commit(
                 replace,
                 vec![repo_path("old.txt")],
+                vec![],
                 "remove old".to_string(),
                 "add new".to_string(),
             )
@@ -9121,7 +9253,13 @@ mod tests {
         let repository = open_repository(repo_dir.path(), cx);
         assert!(
             repository
-                .split_commit(root, vec![repo_path("a.txt")], "x".into(), "y".into())
+                .split_commit(
+                    root,
+                    vec![repo_path("a.txt")],
+                    vec![],
+                    "x".into(),
+                    "y".into(),
+                )
                 .await
                 .is_err()
         );
@@ -9130,6 +9268,7 @@ mod tests {
                 .split_commit(
                     only.clone(),
                     vec![repo_path("b.txt")],
+                    vec![],
                     "x".into(),
                     "y".into()
                 )
@@ -9138,13 +9277,85 @@ mod tests {
         );
         assert!(
             repository
-                .split_commit(only, vec![], "x".into(), "y".into())
+                .split_commit(only, vec![], vec![], "x".into(), "y".into())
                 .await
                 .is_err()
         );
         assert_eq!(
             git_command_output(repo_dir.path(), ["rev-parse", "main"]),
             before
+        );
+    }
+
+    #[gpui::test]
+    async fn test_split_commit_by_hunks_puts_only_the_chosen_hunks_in_the_first_commit(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let original: String = (1..=30).map(|line| format!("line {line}\n")).collect();
+        commit_file(repo_dir.path(), "a.txt", &original, "base");
+        let changed = original
+            .replace("line 3\n", "line three\n")
+            .replace("line 25\n", "line twenty-five\n");
+        let target = commit_file(repo_dir.path(), "a.txt", &changed, "two edits");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let hunks = repository.commit_hunks(target.clone()).await.unwrap();
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].index, 0);
+        assert!(hunks[0].body.contains("+line three"));
+        assert!(hunks[1].body.contains("+line twenty-five"));
+
+        let tip = repository
+            .split_commit(
+                target,
+                vec![],
+                vec![HunkSelection {
+                    path: repo_path("a.txt"),
+                    hunks: vec![1],
+                }],
+                "late edit".into(),
+                "early edit".into(),
+            )
+            .await
+            .unwrap();
+
+        let first_version = git_command_output(repo_dir.path(), ["show", "HEAD~1:a.txt"]);
+        assert!(first_version.contains("line twenty-five"));
+        assert!(first_version.contains("line 3\n") || first_version.contains("line 3"));
+        assert!(!first_version.contains("line three"));
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", "HEAD:a.txt"]),
+            changed.trim_end()
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            tip
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3"]),
+            "early edit\nlate edit\nbase"
+        );
+
+        assert!(
+            repository
+                .split_commit(
+                    tip,
+                    vec![],
+                    vec![HunkSelection {
+                        path: repo_path("a.txt"),
+                        hunks: vec![0, 7],
+                    }],
+                    "x".into(),
+                    "y".into(),
+                )
+                .await
+                .is_err(),
+            "a hunk that does not exist is an error"
         );
     }
 

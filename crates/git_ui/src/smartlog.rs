@@ -2709,6 +2709,7 @@ impl Smartlog {
         &mut self,
         sha: Oid,
         first_paths: Vec<RepoPath>,
+        first_hunks: Vec<git::repository::HunkSelection>,
         first_message: String,
         second_message: String,
         window: &mut Window,
@@ -2723,6 +2724,7 @@ impl Smartlog {
                     repository.split_commit(
                         sha.to_string(),
                         first_paths,
+                        first_hunks,
                         first_message,
                         second_message,
                     )

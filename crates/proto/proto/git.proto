@@ -736,6 +736,29 @@ message GitSplitCommit {
   repeated string first_paths = 4;
   string first_message = 5;
   string second_message = 6;
+  repeated GitHunkSelection first_hunks = 7;
+}
+
+message GitHunkSelection {
+  string path = 1;
+  repeated uint32 hunks = 2;
+}
+
+message GitCommitHunks {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string sha = 3;
+}
+
+message GitCommitHunksResponse {
+  repeated GitCommitHunk hunks = 1;
+}
+
+message GitCommitHunk {
+  string path = 1;
+  uint32 index = 2;
+  string header = 3;
+  string body = 4;
 }
 
 message GitStackStep {

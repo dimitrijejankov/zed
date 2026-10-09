@@ -538,7 +538,9 @@ message Envelope {
     GitSplitCommit git_split_commit = 506;
     GitAbsorb git_absorb = 507;
     GitAbsorbResponse git_absorb_response = 508;
-    GitRangeCommit git_range_commit = 509; // current max
+    GitRangeCommit git_range_commit = 509;
+    GitCommitHunks git_commit_hunks = 510;
+    GitCommitHunksResponse git_commit_hunks_response = 511; // current max
   }
 
   reserved 87 to 88;

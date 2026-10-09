@@ -1112,6 +1112,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_split_commit);
         client.add_entity_request_handler(Self::handle_absorb);
         client.add_entity_request_handler(Self::handle_range_commit);
+        client.add_entity_request_handler(Self::handle_commit_hunks);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4310,6 +4311,34 @@ impl GitStore {
         Ok(proto::GitRewordCommitResponse { sha })
     }
 
+    async fn handle_commit_hunks(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitCommitHunks>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitCommitHunksResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let sha = envelope.payload.sha;
+
+        let hunks = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.commit_hunks(sha)
+            })
+            .await??;
+
+        Ok(proto::GitCommitHunksResponse {
+            hunks: hunks
+                .into_iter()
+                .map(|hunk| proto::GitCommitHunk {
+                    path: hunk.path.as_unix_str().to_owned(),
+                    index: hunk.index,
+                    header: hunk.header,
+                    body: hunk.body,
+                })
+                .collect(),
+        })
+    }
+
     async fn handle_absorb(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GitAbsorb>,
@@ -4341,12 +4370,23 @@ impl GitStore {
             .iter()
             .map(|path| RepoPath::from_proto(path))
             .collect::<Result<Vec<_>>>()?;
+        let first_hunks = payload
+            .first_hunks
+            .iter()
+            .map(|selection| {
+                Ok(git::repository::HunkSelection {
+                    path: RepoPath::from_proto(&selection.path)?,
+                    hunks: selection.hunks.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let sha = repository_handle
             .update(&mut cx, |repository_handle, _| {
                 repository_handle.split_commit(
                     payload.sha,
                     first_paths,
+                    first_hunks,
                     payload.first_message,
                     payload.second_message,
                 )
@@ -9953,6 +9993,42 @@ impl Repository {
         })
     }
 
+    /// The hunks `sha` changed that can be put in a split one by one.
+    pub fn commit_hunks(
+        &mut self,
+        sha: String,
+    ) -> oneshot::Receiver<Result<Vec<git::repository::CommitHunk>>> {
+        let id = self.id;
+        self.send_job("commit_hunks", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.commit_hunks(sha).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitCommitHunks {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            sha,
+                        })
+                        .await?;
+                    response
+                        .hunks
+                        .into_iter()
+                        .map(|hunk| {
+                            Ok(git::repository::CommitHunk {
+                                path: RepoPath::from_proto(&hunk.path)?,
+                                index: hunk.index,
+                                header: hunk.header,
+                                body: hunk.body,
+                            })
+                        })
+                        .collect()
+                }
+            }
+        })
+    }
+
     /// Works out which commit of `base..HEAD` each uncommitted change belongs in, and with
     /// `apply` folds them in.
     pub fn absorb(&mut self, base: String, apply: bool) -> oneshot::Receiver<Result<AbsorbPlan>> {
@@ -9986,6 +10062,7 @@ impl Repository {
         &mut self,
         sha: String,
         first_paths: Vec<RepoPath>,
+        first_hunks: Vec<git::repository::HunkSelection>,
         first_message: String,
         second_message: String,
     ) -> oneshot::Receiver<Result<String>> {
@@ -9997,7 +10074,13 @@ impl Repository {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
                         backend
-                            .split_commit(sha, first_paths, first_message, second_message)
+                            .split_commit(
+                                sha,
+                                first_paths,
+                                first_hunks,
+                                first_message,
+                                second_message,
+                            )
                             .await
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
@@ -10012,6 +10095,13 @@ impl Repository {
                                     .collect(),
                                 first_message,
                                 second_message,
+                                first_hunks: first_hunks
+                                    .into_iter()
+                                    .map(|selection| proto::GitHunkSelection {
+                                        path: selection.path.as_unix_str().to_owned(),
+                                        hunks: selection.hunks,
+                                    })
+                                    .collect(),
                             })
                             .await?;
                         Ok(response.sha)

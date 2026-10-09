@@ -1804,10 +1804,18 @@ impl GitRepository for FakeGitRepository {
         &self,
         _sha: String,
         _first_paths: Vec<RepoPath>,
+        _first_hunks: Vec<git::repository::HunkSelection>,
         _first_message: String,
         _second_message: String,
     ) -> BoxFuture<'_, Result<String>> {
         async { anyhow::bail!("splitting commits is not supported by the fake repository") }.boxed()
+    }
+
+    fn commit_hunks(
+        &self,
+        _sha: String,
+    ) -> BoxFuture<'_, Result<Vec<git::repository::CommitHunk>>> {
+        async { Ok(Vec::new()) }.boxed()
     }
 
     fn absorb(
