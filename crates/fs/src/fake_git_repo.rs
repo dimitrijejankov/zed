@@ -1800,6 +1800,16 @@ impl GitRepository for FakeGitRepository {
         async { anyhow::bail!("editing stacks is not supported by the fake repository") }.boxed()
     }
 
+    fn split_commit(
+        &self,
+        _sha: String,
+        _first_paths: Vec<RepoPath>,
+        _first_message: String,
+        _second_message: String,
+    ) -> BoxFuture<'_, Result<String>> {
+        async { anyhow::bail!("splitting commits is not supported by the fake repository") }.boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

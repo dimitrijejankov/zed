@@ -52,6 +52,7 @@ mod bookmarks;
 mod edit_stack;
 mod persistence;
 mod sidebar;
+mod split;
 
 use persistence::SmartlogSettings;
 use sidebar::SidebarState;
@@ -1869,6 +1870,16 @@ impl Smartlog {
         } else {
             None
         };
+        let can_split = is_draft
+            && self
+                .commits
+                .get(&sha)
+                .is_some_and(|commit| commit.parents.len() == 1)
+            && !self.rebase_in_progress(cx);
+        let split_details = self
+            .commits
+            .get(&sha)
+            .map(|commit| (commit.subject.to_string(), commit.message.to_string()));
         let can_amend_to = is_draft
             && !is_head
             && self.protected_from_hiding.contains(&sha)
@@ -1915,6 +1926,32 @@ impl Smartlog {
                         }
                     })
                 })
+                .when_some(
+                    split_details.filter(|_| can_split),
+                    |menu, (subject, message)| {
+                        menu.entry("Split…", None, {
+                            let smartlog = smartlog.clone();
+                            let workspace = workspace.clone();
+                            let repository = repository.clone();
+                            move |window, cx| {
+                                let smartlog = smartlog.clone();
+                                let repository = repository.clone();
+                                let subject = subject.clone();
+                                let message = message.clone();
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.toggle_modal(window, cx, |window, cx| {
+                                            split::SplitModal::new(
+                                                smartlog, repository, sha, &subject, message,
+                                                window, cx,
+                                            )
+                                        });
+                                    })
+                                    .log_err();
+                            }
+                        })
+                    },
+                )
                 .when_some(edit_stack, |menu, (base, tip, entries)| {
                     menu.entry("Edit Stack…", None, {
                         let smartlog = smartlog.clone();
@@ -2462,6 +2499,40 @@ impl Smartlog {
             anyhow::Ok(())
         });
         self.run_logged("Failed to edit the stack", task, window, cx);
+    }
+
+    fn apply_split(
+        &mut self,
+        sha: Oid,
+        first_paths: Vec<RepoPath>,
+        first_message: String,
+        second_message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let second = repository
+                .update(cx, |repository, _| {
+                    repository.split_commit(
+                        sha.to_string(),
+                        first_paths,
+                        first_message,
+                        second_message,
+                    )
+                })
+                .await??;
+            this.update_in(cx, |this, window, cx| {
+                this.selection.clear();
+                this.selection_anchor = None;
+                this.pending_selection = second.parse::<Oid>().ok();
+                this.refresh(window, cx);
+            })?;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to split the commit", task, window, cx);
     }
 
     fn drag_rebase_plan(&self, source: Oid, target: Oid, cx: &App) -> Option<RebasePlan> {
@@ -5189,6 +5260,23 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.toggle_modal(window, cx, |_, cx| {
                 edit_stack::EditStackModal::new(smartlog_handle, stack_base, tip, entries, cx)
+            });
+        });
+        draw(cx);
+
+        let split_smartlog = smartlog.downgrade();
+        let split_repository = repository.clone();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                split::SplitModal::new(
+                    split_smartlog,
+                    split_repository,
+                    third,
+                    "third",
+                    "third\n\nA longer description.".to_string(),
+                    window,
+                    cx,
+                )
             });
         });
         draw(cx);

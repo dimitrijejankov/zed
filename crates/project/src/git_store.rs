@@ -1108,6 +1108,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_fold_commits);
         client.add_entity_request_handler(Self::handle_amend_to);
         client.add_entity_request_handler(Self::handle_edit_stack);
+        client.add_entity_request_handler(Self::handle_split_commit);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4283,6 +4284,34 @@ impl GitStore {
             .await??;
 
         Ok(proto::GitCommitBeforeTimeResponse { sha })
+    }
+
+    async fn handle_split_commit(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitSplitCommit>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitRewordCommitResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let payload = envelope.payload;
+        let first_paths = payload
+            .first_paths
+            .iter()
+            .map(|path| RepoPath::from_proto(path))
+            .collect::<Result<Vec<_>>>()?;
+
+        let sha = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.split_commit(
+                    payload.sha,
+                    first_paths,
+                    payload.first_message,
+                    payload.second_message,
+                )
+            })
+            .await??;
+
+        Ok(proto::GitRewordCommitResponse { sha })
     }
 
     async fn handle_edit_stack(
@@ -9855,6 +9884,46 @@ impl Repository {
         );
         self.schedule_scan_if_local(cx);
         receiver
+    }
+
+    /// Splits `sha` in two: the first commit gets only the changes to `first_paths`.
+    pub fn split_commit(
+        &mut self,
+        sha: String,
+        first_paths: Vec<RepoPath>,
+        first_message: String,
+        second_message: String,
+    ) -> oneshot::Receiver<Result<String>> {
+        let id = self.id;
+        self.send_job(
+            "split_commit",
+            Some("git commit-tree".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend
+                            .split_commit(sha, first_paths, first_message, second_message)
+                            .await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let response = client
+                            .request(proto::GitSplitCommit {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                sha,
+                                first_paths: first_paths
+                                    .iter()
+                                    .map(|path| path.as_unix_str().to_owned())
+                                    .collect(),
+                                first_message,
+                                second_message,
+                            })
+                            .await?;
+                        Ok(response.sha)
+                    }
+                }
+            },
+        )
     }
 
     /// Rebuilds the straight chain of commits `base..tip` as `steps`.

@@ -697,6 +697,15 @@ message GitAmendTo {
   string sha = 3;
 }
 
+message GitSplitCommit {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string sha = 3;
+  repeated string first_paths = 4;
+  string first_message = 5;
+  string second_message = 6;
+}
+
 message GitStackStep {
   repeated string sources = 1;
   optional string message = 2;

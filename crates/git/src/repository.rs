@@ -1200,6 +1200,17 @@ pub trait GitRepository: Send + Sync {
         steps: Vec<StackStep>,
     ) -> BoxFuture<'_, Result<String>>;
 
+    /// Splits `sha` into two commits: the first contains only the changes to `first_paths`, the
+    /// second the rest. Everything built on it is rebuilt. Returns the sha of the second commit,
+    /// which has the original commit's tree.
+    fn split_commit(
+        &self,
+        sha: String,
+        first_paths: Vec<RepoPath>,
+        first_message: String,
+        second_message: String,
+    ) -> BoxFuture<'_, Result<String>>;
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
     /// The newest commit reachable from `rev` that was made at or before `unix_timestamp`.
@@ -3016,6 +3027,29 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn split_commit(
+        &self,
+        sha: String,
+        first_paths: Vec<RepoPath>,
+        first_message: String,
+        second_message: String,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let mut git = git;
+                split_commit_with_git(
+                    &mut git,
+                    &sha,
+                    &first_paths,
+                    &first_message,
+                    &second_message,
+                )
+                .await
+            })
+            .boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -4421,6 +4455,81 @@ async fn merge_trees(
             String::from_utf8_lossy(&output.stderr)
         ),
     }
+}
+
+async fn split_commit_with_git(
+    git: &mut GitBinary,
+    sha: &str,
+    first_paths: &[RepoPath],
+    first_message: &str,
+    second_message: &str,
+) -> Result<String> {
+    let target = git
+        .run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+        .await?;
+    let parent = git
+        .run(&["rev-parse", "--verify", &format!("{target}^")])
+        .await
+        .context("A root commit can't be split")?;
+    let parent_count = git
+        .run(&["rev-list", "--parents", "-n", "1", &target])
+        .await?
+        .split_whitespace()
+        .count()
+        - 1;
+    anyhow::ensure!(parent_count == 1, "A merge commit can't be split");
+    anyhow::ensure!(
+        !first_paths.is_empty(),
+        "The first commit needs at least one file"
+    );
+
+    let parent_tree = tree_of(git, &parent).await?;
+    let first_tree = git
+        .with_temp_index(async |git| {
+            git.run(&["read-tree", &parent_tree]).await?;
+            for path in first_paths {
+                let path = path.as_unix_str();
+                let entry = git.run_raw(&["ls-tree", "-z", &target, "--", path]).await?;
+                match entry.trim_end_matches('\0').split_once('\t') {
+                    Some((info, _)) => {
+                        let mut fields = info.split_whitespace();
+                        let (Some(mode), Some(_kind), Some(object)) =
+                            (fields.next(), fields.next(), fields.next())
+                        else {
+                            anyhow::bail!("Could not read {path} in the commit");
+                        };
+                        git.run(&["update-index", "--add", "--cacheinfo", mode, object, path])
+                            .await?;
+                    }
+                    None => {
+                        git.run(&["update-index", "--force-remove", "--", path])
+                            .await?;
+                    }
+                }
+            }
+            git.run(&["write-tree"]).await
+        })
+        .await?;
+    anyhow::ensure!(
+        first_tree != tree_of(git, &target).await?,
+        "The first commit would contain every change, so there is nothing to split"
+    );
+
+    let first =
+        commit_tree_like(git, &target, &first_tree, &[&parent], Some(first_message)).await?;
+    let second_tree = tree_of(git, &target).await?;
+    let second =
+        commit_tree_like(git, &target, &second_tree, &[&first], Some(second_message)).await?;
+
+    let rewritten: HashMap<String, String> = HashMap::from_iter([(target.clone(), second.clone())]);
+    replay_descendants(
+        git,
+        &target,
+        rewritten,
+        "No local branch or detached HEAD contains this commit, so it can't be split",
+    )
+    .await?;
+    Ok(second)
 }
 
 async fn edit_stack_with_git(
@@ -8472,6 +8581,132 @@ mod tests {
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_split_commit_separates_files_and_rebuilds_descendants(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "base.txt", "base", "base");
+        fs::write(repo_dir.path().join("a.txt"), "a").unwrap();
+        fs::write(repo_dir.path().join("b.txt"), "b").unwrap();
+        git_command(repo_dir.path(), ["add", "a.txt", "b.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "add a and b"]);
+        let both = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        commit_file(repo_dir.path(), "c.txt", "c", "add c");
+        git_command(repo_dir.path(), ["branch", "on-both", &both]);
+        let tip_tree = git_command_output(repo_dir.path(), ["rev-parse", "HEAD^{tree}"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let second = repository
+            .split_commit(
+                both,
+                vec![repo_path("a.txt")],
+                "add a".to_string(),
+                "add b".to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-4"]),
+            "add c\nadd b\nadd a\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "HEAD~2"]),
+            "a.txt\nbase.txt"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "HEAD~1"]),
+            "a.txt\nb.txt\nbase.txt"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD^{tree}"]),
+            tip_tree
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "on-both"]),
+            second
+        );
+    }
+
+    #[gpui::test]
+    async fn test_split_commit_puts_a_deleted_file_in_the_first_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "old.txt", "old", "base");
+        git_command(repo_dir.path(), ["rm", "old.txt"]);
+        fs::write(repo_dir.path().join("new.txt"), "new").unwrap();
+        git_command(repo_dir.path(), ["add", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "replace"]);
+        let replace = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .split_commit(
+                replace,
+                vec![repo_path("old.txt")],
+                "remove old".to_string(),
+                "add new".to_string(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "HEAD~1"]),
+            ""
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "HEAD"]),
+            "new.txt"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_split_commit_refuses_when_there_is_nothing_to_split(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let root = commit_file(repo_dir.path(), "a.txt", "a", "root");
+        let only = commit_file(repo_dir.path(), "b.txt", "b", "only b");
+        let before = git_command_output(repo_dir.path(), ["rev-parse", "main"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        assert!(
+            repository
+                .split_commit(root, vec![repo_path("a.txt")], "x".into(), "y".into())
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .split_commit(
+                    only.clone(),
+                    vec![repo_path("b.txt")],
+                    "x".into(),
+                    "y".into()
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .split_commit(only, vec![], "x".into(), "y".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            before
         );
     }
 }
