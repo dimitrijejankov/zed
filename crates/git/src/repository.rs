@@ -119,6 +119,10 @@ pub struct StackStep {
 /// reachable without it being a branch, and git decorates the commit with them in the draft log.
 pub const HIDDEN_COMMIT_REF_PREFIX: &str = "refs/smartlog/hidden/";
 
+/// Marks a commit that a rebase moved a branch away from, so it stays in the Smartlog as a stack
+/// of its own instead of becoming unreachable.
+pub const KEPT_COMMIT_REF_PREFIX: &str = "refs/smartlog/kept/";
+
 /// Number of commits to load per chunk for the git graph.
 pub const GRAPH_CHUNK_SIZE: usize = 1000;
 
@@ -866,6 +870,7 @@ impl LogSource {
                 Cow::Borrowed("--decorate-refs=refs/tags/*"),
                 Cow::Owned(format!("--decorate-refs={HIDDEN_COMMIT_REF_PREFIX}*")),
                 Cow::Borrowed("--branches"),
+                Cow::Owned(format!("--glob={KEPT_COMMIT_REF_PREFIX}*")),
                 Cow::Borrowed("HEAD"),
                 Cow::Borrowed("--not"),
                 Cow::Borrowed(trunk.as_str()),
@@ -3048,6 +3053,7 @@ impl GitRepository for RealGitRepository {
         self.executor
             .spawn(async move {
                 let git = git?;
+                keep_commit_left_behind(&git, &old_base, branch.as_deref()).await?;
                 let mut arguments = vec![
                     "rebase".to_string(),
                     "--autostash".to_string(),
@@ -4685,6 +4691,47 @@ fn select_changes(original: &str, file: &DiffFile, selection: &HunkSelection) ->
         result.push_str(line);
     }
     Ok(result)
+}
+
+/// A rebase of `old_base..branch` moves `branch`, which can leave `old_base` and the commits below
+/// it reachable from nothing. They are given a ref of their own unless another branch, tag or
+/// remote branch still contains them.
+async fn keep_commit_left_behind(
+    git: &GitBinary,
+    old_base: &str,
+    rebased_branch: Option<&str>,
+) -> Result<()> {
+    let sha = git
+        .run(&["rev-parse", "--verify", &format!("{old_base}^{{commit}}")])
+        .await?;
+    let moving = match rebased_branch {
+        Some(branch) => format!("refs/heads/{branch}"),
+        None => git
+            .run(&["symbolic-ref", "-q", "HEAD"])
+            .await
+            .unwrap_or_default(),
+    };
+    let containing = git
+        .run(&[
+            "for-each-ref",
+            "--contains",
+            &sha,
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+            KEPT_COMMIT_REF_PREFIX,
+        ])
+        .await?;
+    if containing.lines().all(|name| name == moving) {
+        git.run(&[
+            "update-ref",
+            &format!("{KEPT_COMMIT_REF_PREFIX}{sha}"),
+            &sha,
+        ])
+        .await?;
+    }
+    Ok(())
 }
 
 async fn commit_diff_files(git: &GitBinary, parent: &str, target: &str) -> Result<Vec<DiffFile>> {
@@ -9479,6 +9526,84 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["show", "HEAD:a.txt"]),
             changed.trim_end()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rebasing_a_tip_keeps_the_commits_it_leaves_behind_in_the_draft_log(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "base.txt", "base", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        let first = commit_file(repo_dir.path(), "a.txt", "a", "first");
+        let second = commit_file(repo_dir.path(), "b.txt", "b", "second");
+        commit_file(repo_dir.path(), "c.txt", "c", "temporary");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .rebase_onto(first.clone(), second.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3", "feature"]),
+            "temporary\nfirst\nbase"
+        );
+
+        let (sender, receiver) = smol::channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::Draft("main".into()), LogOrder::DateOrder, sender)
+            .await
+            .unwrap();
+        let mut shown = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            shown.extend(chunk.into_iter().map(|commit| commit.sha.to_string()));
+        }
+        assert!(
+            shown.contains(&second),
+            "the commit the branch moved away from must stay visible"
+        );
+        assert!(
+            shown.contains(&first),
+            "its ancestors stay visible too, and the rebased tip is shown"
+        );
+        assert_eq!(shown.len(), 3);
+    }
+
+    #[gpui::test]
+    async fn test_rebasing_does_not_mark_commits_other_branches_still_contain(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "base.txt", "base", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        let first = commit_file(repo_dir.path(), "a.txt", "a", "first");
+        git_command(repo_dir.path(), ["branch", "keeps-first"]);
+        commit_file(repo_dir.path(), "b.txt", "b", "second");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .rebase_onto("main".into(), first, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_command_output(
+                repo_dir.path(),
+                [
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    KEPT_COMMIT_REF_PREFIX
+                ]
+            ),
+            ""
         );
     }
 
