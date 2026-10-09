@@ -1818,6 +1818,10 @@ impl GitRepository for FakeGitRepository {
         async { Ok(git::repository::AbsorbPlan::default()) }.boxed()
     }
 
+    fn range_commit(&self, _base: String, _tip: String) -> BoxFuture<'_, Result<String>> {
+        async { anyhow::bail!("range commits are not supported by the fake repository") }.boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

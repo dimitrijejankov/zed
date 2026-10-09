@@ -1100,6 +1100,21 @@ impl Smartlog {
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
             .child({
+                let contiguous = fold_chain(&self.parents, &self.selection).is_some();
+                Button::new("smartlog-view-range", "View Changes")
+                    .start_icon(Icon::new(IconName::Diff).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .disabled(!contiguous)
+                    .tooltip(Tooltip::text(if contiguous {
+                        "View everything the selected commits changed as one diff"
+                    } else {
+                        "Select an unbroken chain of commits to view their changes together"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.view_changes_across_selection(window, cx);
+                    }))
+            })
+            .child({
                 let can_fold = fold_chain(&self.parents, &self.selection).is_some();
                 Button::new("smartlog-fold", "Fold")
                     .start_icon(Icon::new(IconName::FoldVertical).size(IconSize::Small))

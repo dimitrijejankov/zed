@@ -1286,6 +1286,10 @@ pub trait GitRepository: Send + Sync {
     /// edits. With `apply`, folds every change that has a single such commit into it.
     fn absorb(&self, base: String, apply: bool) -> BoxFuture<'_, Result<AbsorbPlan>>;
 
+    /// Creates, without referencing it from anywhere, a commit with `tip`'s tree on top of `base`,
+    /// so that viewing it shows everything the commits between them changed. Returns its sha.
+    fn range_commit(&self, base: String, tip: String) -> BoxFuture<'_, Result<String>>;
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
     /// The newest commit reachable from `rev` that was made at or before `unix_timestamp`.
@@ -3131,6 +3135,29 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let mut git = git?;
                 absorb_with_git(&mut git, &base, apply).await
+            })
+            .boxed()
+    }
+
+    fn range_commit(&self, base: String, tip: String) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let base = git
+                    .run(&["rev-parse", "--verify", &format!("{base}^{{commit}}")])
+                    .await?;
+                let tip = git
+                    .run(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")])
+                    .await?;
+                let tree = tree_of(&git, &tip).await?;
+                commit_tree_like(
+                    &git,
+                    &tip,
+                    &tree,
+                    &[base.as_str()],
+                    Some("Changes across the selected commits"),
+                )
+                .await
             })
             .boxed()
     }
@@ -9276,6 +9303,37 @@ mod tests {
             }
             .arguments(),
             ["fetch", "upstream", "feature"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_range_commit_shows_everything_changed_across_the_commits(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "base.txt", "base", "base");
+        commit_file(repo_dir.path(), "a.txt", "a", "add a");
+        let tip = commit_file(repo_dir.path(), "b.txt", "b", "add b");
+        let branch_tip = git_command_output(repo_dir.path(), ["rev-parse", "main"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let range = repository.range_commit(base.clone(), tip).await.unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["diff", "--name-only", &base, &range]),
+            "a.txt\nb.txt"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            branch_tip
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["branch", "--contains", &range]),
+            ""
         );
     }
 }

@@ -537,7 +537,8 @@ message Envelope {
     GitEditStack git_edit_stack = 505;
     GitSplitCommit git_split_commit = 506;
     GitAbsorb git_absorb = 507;
-    GitAbsorbResponse git_absorb_response = 508; // current max
+    GitAbsorbResponse git_absorb_response = 508;
+    GitRangeCommit git_range_commit = 509; // current max
   }
 
   reserved 87 to 88;

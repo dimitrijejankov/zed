@@ -122,10 +122,22 @@ fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspa
     let workspace_handle = workspace.weak_handle();
 
     cx.spawn_in(window, async move |workspace, cx| {
-        let trunk = trunk_receiver
+        let default_branch = trunk_receiver
             .await
-            .context("default branch request was canceled")??
-            .context("could not determine the trunk branch for this repository")?;
+            .context("default branch request was canceled")??;
+        // A repository with no remote, or no commits yet, has no default branch, so the Smartlog
+        // falls back to the branch that is checked out.
+        let trunk = match default_branch {
+            Some(trunk) => trunk,
+            None => repository
+                .read_with(cx, |repository, _| {
+                    repository
+                        .branch
+                        .as_ref()
+                        .map(|branch| SharedString::from(branch.name().to_string()))
+                })
+                .unwrap_or_else(|| "main".into()),
+        };
         workspace.update_in(cx, |workspace, window, cx| {
             let existing = workspace
                 .items_of_type::<Smartlog>(cx)
@@ -1772,6 +1784,45 @@ impl Smartlog {
         )
     }
 
+    /// Opens one diff of everything the selected, unbroken chain of commits changed.
+    fn view_changes_across_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let Some(chain) = fold_chain(&self.parents, &self.selection) else {
+            return;
+        };
+        let (Some(first), Some(last)) = (chain.first(), chain.last()) else {
+            return;
+        };
+        let Some(base) = self.parents.get(first).copied().flatten() else {
+            return;
+        };
+        let (base, tip) = (base.to_string(), last.to_string());
+        let workspace = self.workspace.clone();
+
+        let task = cx.spawn_in(window, async move |_, cx| {
+            let sha = repository
+                .update(cx, |repository, _| repository.range_commit(base, tip))
+                .await??;
+            cx.update(|window, cx| {
+                window.defer(cx, move |window, cx| {
+                    CommitView::open(
+                        sha,
+                        repository.downgrade(),
+                        workspace,
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+            })?;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to view the changes", task, window, cx);
+    }
+
     fn fold_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.repository(cx) else {
             return;
@@ -2606,6 +2657,52 @@ impl Smartlog {
             anyhow::Ok(())
         });
         self.run_logged("Failed to download commits", task, window, cx);
+    }
+
+    fn create_initial_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let askpass = self.askpass_delegate("git commit", window, cx);
+        let task = cx.spawn_in(window, async move |_, cx| {
+            repository
+                .update(cx, |repository, cx| {
+                    repository.commit(
+                        "Initial commit".into(),
+                        None,
+                        CommitOptions {
+                            allow_empty: true,
+                            ..Default::default()
+                        },
+                        askpass,
+                        cx,
+                    )
+                })
+                .await??;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to create the initial commit", task, window, cx);
+    }
+
+    /// The name of another worktree that has `sha` checked out, if there is one.
+    fn worktree_checked_out_at(&self, sha: Oid, cx: &App) -> Option<String> {
+        let repository = self.repository(cx)?;
+        let repository = repository.read(cx);
+        let sha = sha.to_string();
+        repository
+            .linked_worktrees
+            .iter()
+            .find(|worktree| {
+                worktree.sha.as_ref() == sha
+                    && !worktree.is_bare
+                    && worktree.path != repository.work_directory_abs_path.as_ref()
+            })
+            .and_then(|worktree| {
+                worktree
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
     }
 
     fn apply_split(
@@ -3816,6 +3913,20 @@ impl Smartlog {
                             .into_iter()
                             .map(|name| Chip::new(name).label_size(LabelSize::Small)),
                     )
+                    .when_some(self.worktree_checked_out_at(sha, cx), |this, worktree| {
+                        this.child(
+                            div()
+                                .id(("smartlog-worktree", index))
+                                .child(
+                                    Chip::new(format!("In {worktree}"))
+                                        .icon(IconName::FolderOpen)
+                                        .label_size(LabelSize::Small),
+                                )
+                                .tooltip(Tooltip::text(
+                                    "This commit is checked out in another worktree",
+                                )),
+                        )
+                    })
                     .when(row.is_head && self.uncommitted_files.is_empty(), |this| {
                         this.child(Self::you_are_here_pill(cx))
                     })
@@ -4160,16 +4271,47 @@ impl Render for Smartlog {
                         ),
                 )
             })
-            .when(rows.is_empty() && self.error.is_none(), |this| {
-                this.child(
-                    Label::new(format!(
-                        "No draft commits. Everything is already on {}.",
-                        self.trunk
-                    ))
-                    .color(Color::Muted)
-                    .m_2(),
-                )
-            })
+            .when(
+                rows.is_empty() && self.error.is_none() && self.head.is_some(),
+                |this| {
+                    this.child(
+                        Label::new(format!(
+                            "No draft commits. Everything is already on {}.",
+                            self.trunk
+                        ))
+                        .color(Color::Muted)
+                        .m_2(),
+                    )
+                },
+            )
+            .when(
+                rows.is_empty() && self.error.is_none() && self.head.is_none(),
+                |this| {
+                    this.child(
+                        v_flex()
+                            .m_4()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                Label::new("This repository has no commits yet.")
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Button::new(
+                                    "smartlog-create-initial-commit",
+                                    "Create empty initial commit",
+                                )
+                                .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                                .style(ButtonStyle::Filled)
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.create_initial_commit(window, cx);
+                                    },
+                                )),
+                            ),
+                    )
+                },
+            )
             .children(rows)
             .children(self.render_shelved_changes(cx));
 
@@ -5645,5 +5787,70 @@ mod tests {
         }
         let after_continue = draft_subjects(cx);
         assert_eq!(after_continue.len(), 5, "{after_continue:?}");
+    }
+
+    #[gpui::test]
+    async fn an_empty_repository_opens_and_offers_an_initial_commit(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use project::Project;
+        use serde_json::json;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {}, "a.txt": "a" }))
+            .await;
+        fs.with_git_state(Path::new("/project/.git"), true, |state| {
+            state.refs.remove("HEAD");
+        })
+        .expect("the fake repository exists");
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository_id = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("repository")
+                .read(cx)
+                .id
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            let workspace_handle = workspace.weak_handle();
+            let smartlog = cx.new(|cx| {
+                Smartlog::new(
+                    repository_id,
+                    git_store,
+                    workspace_handle,
+                    "main".into(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(smartlog), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        workspace.read_with(&*cx, |workspace, cx| {
+            let smartlog = workspace
+                .active_item_as::<Smartlog>(cx)
+                .expect("the Smartlog is open");
+            let smartlog = smartlog.read(cx);
+            assert!(smartlog.head.is_none());
+            assert!(smartlog.layout.rows.is_empty());
+        });
     }
 }

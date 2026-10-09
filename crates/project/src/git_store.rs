@@ -1111,6 +1111,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_edit_stack);
         client.add_entity_request_handler(Self::handle_split_commit);
         client.add_entity_request_handler(Self::handle_absorb);
+        client.add_entity_request_handler(Self::handle_range_commit);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4289,6 +4290,24 @@ impl GitStore {
             .await??;
 
         Ok(proto::GitCommitBeforeTimeResponse { sha })
+    }
+
+    async fn handle_range_commit(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRangeCommit>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitRewordCommitResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let payload = envelope.payload;
+
+        let sha = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.range_commit(payload.base, payload.tip)
+            })
+            .await??;
+
+        Ok(proto::GitRewordCommitResponse { sha })
     }
 
     async fn handle_absorb(
@@ -9908,6 +9927,30 @@ impl Repository {
         );
         self.schedule_scan_if_local(cx);
         receiver
+    }
+
+    /// Creates an unreferenced commit holding everything changed between `base` and `tip`, so it
+    /// can be viewed as one diff.
+    pub fn range_commit(&mut self, base: String, tip: String) -> oneshot::Receiver<Result<String>> {
+        let id = self.id;
+        self.send_job("range_commit", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.range_commit(base, tip).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitRangeCommit {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            base,
+                            tip,
+                        })
+                        .await?;
+                    Ok(response.sha)
+                }
+            }
+        })
     }
 
     /// Works out which commit of `base..HEAD` each uncommitted change belongs in, and with
