@@ -595,6 +595,7 @@ pub struct RepositoryId(pub u64);
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
     pub message: Option<SharedString>,
+    pub rebase_in_progress: bool,
 }
 
 #[derive(Clone)]
@@ -1101,6 +1102,9 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_get_head_sha);
         client.add_entity_request_handler(Self::handle_edit_ref);
         client.add_entity_request_handler(Self::handle_reword_commit);
+        client.add_entity_request_handler(Self::handle_rebase_onto);
+        client.add_entity_request_handler(Self::handle_rebase_continue);
+        client.add_entity_request_handler(Self::handle_rebase_abort);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
         client.add_entity_stream_request_handler(Self::handle_get_initial_graph_data);
@@ -4258,6 +4262,63 @@ impl GitStore {
         Ok(proto::Ack {})
     }
 
+    async fn handle_rebase_onto(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRebaseOnto>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let payload = envelope.payload;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.rebase_onto(
+                    payload.new_base,
+                    payload.old_base,
+                    payload.branch,
+                    cx,
+                )
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_rebase_continue(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRebaseContinue>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.rebase_continue(cx)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_rebase_abort(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRebaseAbort>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.rebase_abort(cx)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
     async fn handle_reword_commit(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GitRewordCommit>,
@@ -6206,6 +6267,7 @@ impl RepositorySnapshot {
                 .map(|(repo_path, _)| repo_path.as_unix_str().to_owned())
                 .collect(),
             merge_message: self.merge.message.as_ref().map(|msg| msg.to_string()),
+            rebase_in_progress: self.merge.rebase_in_progress,
             project_id,
             id: self.id.to_proto(),
             abs_path: self.work_directory_abs_path.to_string_lossy().into_owned(),
@@ -6293,6 +6355,7 @@ impl RepositorySnapshot {
                 .map(|(path, _)| path.as_unix_str().to_owned())
                 .collect(),
             merge_message: self.merge.message.as_ref().map(|msg| msg.to_string()),
+            rebase_in_progress: self.merge.rebase_in_progress,
             project_id,
             id: self.id.to_proto(),
             abs_path: self.work_directory_abs_path.to_string_lossy().into_owned(),
@@ -6505,7 +6568,9 @@ impl MergeDetails {
             .map(|opt| opt.map(SharedString::from))
             .collect::<Vec<_>>();
 
-        let mut conflicts_changed = false;
+        let rebase_in_progress = backend.rebase_in_progress().await;
+        let mut conflicts_changed = self.rebase_in_progress != rebase_in_progress;
+        self.rebase_in_progress = rebase_in_progress;
 
         // Record the merge state for newly conflicted paths
         for path in &current_conflicted_paths {
@@ -9548,6 +9613,111 @@ impl Repository {
         )
     }
 
+    fn schedule_scan_if_local(&mut self, cx: &mut Context<Self>) {
+        let scan_updates_tx =
+            self.git_store()
+                .and_then(|git_store| match &git_store.read(cx).state {
+                    GitStoreState::Local { downstream, .. } => Some(
+                        downstream
+                            .as_ref()
+                            .map(|downstream| downstream.updates_tx.clone()),
+                    ),
+                    _ => None,
+                });
+        if let Some(updates_tx) = scan_updates_tx {
+            self.schedule_scan(updates_tx, cx);
+        }
+    }
+
+    /// Replays the commits between `old_base` and `branch` (or `HEAD`) onto `new_base`. If the
+    /// rebase stops on conflicts the error holds git's output and the rebase stays in progress.
+    pub fn rebase_onto(
+        &mut self,
+        new_base: String,
+        old_base: String,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job(
+            "rebase_onto",
+            Some(format!("git rebase --onto {new_base}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.rebase_onto(new_base, old_base, branch).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitRebaseOnto {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                new_base,
+                                old_base,
+                                branch,
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        );
+        self.schedule_scan_if_local(cx);
+        receiver
+    }
+
+    pub fn rebase_continue(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job(
+            "rebase_continue",
+            Some("git rebase --continue".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.rebase_continue().await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitRebaseContinue {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        );
+        self.schedule_scan_if_local(cx);
+        receiver
+    }
+
+    pub fn rebase_abort(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job(
+            "rebase_abort",
+            Some("git rebase --abort".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.rebase_abort().await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitRebaseAbort {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        );
+        self.schedule_scan_if_local(cx);
+        receiver
+    }
+
     pub fn repair_worktrees(&mut self) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
         self.send_job("repair_worktrees", None, move |repo, _cx| async move {
@@ -10116,8 +10286,10 @@ impl Repository {
                 .into_iter()
                 .filter_map(|path| Some((RepoPath::from_proto(&path).ok()?, vec![]))),
         );
-        let conflicts_changed =
-            self.snapshot.merge.merge_heads_by_conflicted_path != new_merge_heads;
+        let conflicts_changed = self.snapshot.merge.merge_heads_by_conflicted_path
+            != new_merge_heads
+            || self.snapshot.merge.rebase_in_progress != update.rebase_in_progress;
+        self.snapshot.merge.rebase_in_progress = update.rebase_in_progress;
         self.snapshot.merge.merge_heads_by_conflicted_path = new_merge_heads;
         self.snapshot.merge.message = update.merge_message.map(SharedString::from);
         let new_stash_entries = GitStash {

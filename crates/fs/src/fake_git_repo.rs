@@ -1766,6 +1766,23 @@ impl GitRepository for FakeGitRepository {
         self.edit_ref(RefEdit::Delete { ref_name })
     }
 
+    fn rebase_onto(
+        &self,
+        _new_base: String,
+        _old_base: String,
+        _branch: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
+    }
+
+    fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
+    }
+
+    fn rebase_abort(&self) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
+    }
+
     fn reword_commit(&self, _sha: String, _message: String) -> BoxFuture<'_, Result<String>> {
         async { anyhow::bail!("rewording commits is not supported by the fake repository") }.boxed()
     }

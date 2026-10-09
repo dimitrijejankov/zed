@@ -851,6 +851,11 @@ pub trait GitRepository: Send + Sync {
 
     fn merge_message(&self) -> BoxFuture<'_, Option<String>>;
 
+    /// Whether a `git rebase` has stopped and is waiting to be continued or aborted.
+    fn rebase_in_progress(&self) -> BoxFuture<'_, bool> {
+        async { false }.boxed()
+    }
+
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
 
@@ -1151,6 +1156,19 @@ pub trait GitRepository: Send + Sync {
     /// commits. Commit trees are unchanged, so the working tree and index are left alone.
     /// Returns the sha of the reworded commit.
     fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<String>>;
+
+    /// Replays the commits after `old_base` up to `branch` (or `HEAD`) onto `new_base`. When the
+    /// rebase stops on conflicts the error carries git's output and the rebase stays in progress.
+    fn rebase_onto(
+        &self,
+        new_base: String,
+        old_base: String,
+        branch: Option<String>,
+    ) -> BoxFuture<'_, Result<()>>;
+
+    fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
+
+    fn rebase_abort(&self) -> BoxFuture<'_, Result<()>>;
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
 
@@ -1913,6 +1931,16 @@ impl GitRepository for RealGitRepository {
         let path = self.path().join("MERGE_MSG");
         self.executor
             .spawn(async move { std::fs::read_to_string(&path).ok() })
+            .boxed()
+    }
+
+    fn rebase_in_progress(&self) -> BoxFuture<'_, bool> {
+        let git_directory = self.path();
+        self.executor
+            .spawn(async move {
+                git_directory.join("rebase-merge").exists()
+                    || git_directory.join("rebase-apply").exists()
+            })
             .boxed()
     }
 
@@ -2845,6 +2873,49 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
         self.executor
             .spawn(async move { reword_commit_with_git(&git, &sha, &message).await })
+            .boxed()
+    }
+
+    fn rebase_onto(
+        &self,
+        new_base: String,
+        old_base: String,
+        branch: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                let mut arguments = vec![
+                    "rebase".to_string(),
+                    "--autostash".to_string(),
+                    "--onto".to_string(),
+                    new_base,
+                    old_base,
+                ];
+                arguments.extend(branch);
+                run_rebase_command(&git, &arguments).await
+            })
+            .boxed()
+    }
+
+    fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                run_rebase_command(&git, &["rebase".to_string(), "--continue".to_string()]).await
+            })
+            .boxed()
+    }
+
+    fn rebase_abort(&self) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                run_rebase_command(&git, &["rebase".to_string(), "--abort".to_string()]).await
+            })
             .boxed()
     }
 
@@ -4066,6 +4137,22 @@ impl GitBinary {
         command.envs(&self.envs);
         command
     }
+}
+
+/// Runs a rebase subcommand without ever opening an editor. A rebase that stops on conflicts
+/// exits non-zero and reports the conflicts on stdout, so both streams go into the error.
+async fn run_rebase_command(git: &GitBinary, arguments: &[String]) -> Result<()> {
+    let mut command = git.build_command(arguments);
+    command.envs([("GIT_EDITOR", "true"), ("GIT_SEQUENCE_EDITOR", "true")]);
+    let output = command.output().await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Result<String> {
@@ -7432,6 +7519,104 @@ mod tests {
         assert!(
             error.to_string().contains("can't be reworded"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rebase_onto_moves_a_stack_onto_a_new_base(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "a.txt", "a", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        commit_file(repo_dir.path(), "f1.txt", "1", "first");
+        commit_file(repo_dir.path(), "f2.txt", "2", "second");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        commit_file(repo_dir.path(), "trunk.txt", "t", "trunk moved");
+        git_command(repo_dir.path(), ["switch", "feature"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .rebase_onto("main".to_string(), base, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-4"]),
+            "second\nfirst\ntrunk moved\nbase"
+        );
+        assert!(!repository.rebase_in_progress().await);
+    }
+
+    #[gpui::test]
+    async fn test_rebase_onto_stops_on_conflicts_and_can_continue(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "a.txt", "a", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        commit_file(repo_dir.path(), "a.txt", "feature", "feature edit");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        commit_file(repo_dir.path(), "a.txt", "main", "main edit");
+        git_command(repo_dir.path(), ["switch", "feature"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let error = repository
+            .rebase_onto("main".to_string(), base, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CONFLICT"),
+            "unexpected error: {error}"
+        );
+        assert!(repository.rebase_in_progress().await);
+
+        fs::write(repo_dir.path().join("a.txt"), "resolved").unwrap();
+        git_command(repo_dir.path(), ["add", "a.txt"]);
+        repository.rebase_continue().await.unwrap();
+
+        assert!(!repository.rebase_in_progress().await);
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-2"]),
+            "feature edit\nmain edit"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("a.txt")).unwrap(),
+            "resolved"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_rebase_abort_restores_the_original_branch(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "a.txt", "a", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        let feature_tip = commit_file(repo_dir.path(), "a.txt", "feature", "feature edit");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        commit_file(repo_dir.path(), "a.txt", "main", "main edit");
+        git_command(repo_dir.path(), ["switch", "feature"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .rebase_onto("main".to_string(), base, None)
+            .await
+            .unwrap_err();
+        assert!(repository.rebase_in_progress().await);
+
+        repository.rebase_abort().await.unwrap();
+
+        assert!(!repository.rebase_in_progress().await);
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
+            feature_tip
         );
     }
 }
