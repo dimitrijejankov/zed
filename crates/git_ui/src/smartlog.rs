@@ -2291,9 +2291,18 @@ impl Smartlog {
         })
     }
 
+    /// What to rebase for a stack ending at `tip`: its branch, or the commit itself for a stack
+    /// that only a kept ref holds up.
+    fn rebase_target_at(&self, tip: Oid, cx: &App) -> Option<String> {
+        Some(
+            self.local_branch_at(tip, cx)
+                .unwrap_or_else(|| tip.to_string()),
+        )
+    }
+
     fn rebase_plan(&self, root: Oid, cx: &App) -> Option<RebasePlan> {
         plan_rebase(&self.parents, self.head, root, |tip| {
-            self.local_branch_at(tip, cx)
+            self.rebase_target_at(tip, cx)
         })
     }
 
@@ -2743,7 +2752,7 @@ impl Smartlog {
 
     fn drag_rebase_plan(&self, source: Oid, target: Oid, cx: &App) -> Option<RebasePlan> {
         plan_drag_rebase(&self.parents, self.head, source, target, |tip| {
-            self.local_branch_at(tip, cx)
+            self.rebase_target_at(tip, cx)
         })
     }
 

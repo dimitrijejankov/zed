@@ -3053,6 +3053,10 @@ impl GitRepository for RealGitRepository {
         self.executor
             .spawn(async move {
                 let git = git?;
+                let branch = match branch {
+                    Some(tip) => Some(branch_for_stack_tip(&git, &tip).await?),
+                    None => None,
+                };
                 keep_commit_left_behind(&git, &old_base, branch.as_deref()).await?;
                 let mut arguments = vec![
                     "rebase".to_string(),
@@ -4691,6 +4695,51 @@ fn select_changes(original: &str, file: &DiffFile, selection: &HunkSelection) ->
         result.push_str(line);
     }
     Ok(result)
+}
+
+/// A stack that only a kept ref holds up has no branch to rebase. `tip` is then its tip commit,
+/// and it is given a local branch of its own, which a rebase can move and which replaces the kept
+/// ref. A `tip` that is already a local branch is returned as it is.
+async fn branch_for_stack_tip(git: &GitBinary, tip: &str) -> Result<String> {
+    if git
+        .run(&["rev-parse", "--verify", "-q", &format!("refs/heads/{tip}")])
+        .await
+        .is_ok()
+    {
+        return Ok(tip.to_string());
+    }
+    let sha = git
+        .run(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")])
+        .await
+        .with_context(|| format!("{tip} is neither a branch nor a commit"))?;
+    let mut length = 7;
+    let name = loop {
+        let candidate = format!("smartlog/{}", sha.get(..length).unwrap_or(&sha));
+        let existing = git
+            .run(&[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/heads/{candidate}"),
+            ])
+            .await;
+        match existing {
+            Err(_) => break candidate,
+            Ok(existing) if existing == sha => break candidate,
+            Ok(_) if length < sha.len() => length += 1,
+            Ok(_) => anyhow::bail!("Could not find a free branch name for {sha}"),
+        }
+    };
+    git.run(&["update-ref", &format!("refs/heads/{name}"), &sha])
+        .await?;
+    git.run(&[
+        "update-ref",
+        "-d",
+        &format!("{KEPT_COMMIT_REF_PREFIX}{sha}"),
+    ])
+    .await
+    .log_err();
+    Ok(name)
 }
 
 /// A rebase of `old_base..branch` moves `branch`, which can leave `old_base` and the commits below
@@ -9604,6 +9653,57 @@ mod tests {
                 ]
             ),
             ""
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_stack_only_a_kept_ref_holds_can_be_rebased_by_its_tip(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "base.txt", "base", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        commit_file(repo_dir.path(), "a.txt", "a", "first");
+        let tip = commit_file(repo_dir.path(), "b.txt", "b", "second");
+        git_command(
+            repo_dir.path(),
+            [
+                "update-ref".to_string(),
+                format!("{KEPT_COMMIT_REF_PREFIX}{tip}"),
+                tip.clone(),
+            ],
+        );
+        git_command(repo_dir.path(), ["switch", "main"]);
+        git_command(repo_dir.path(), ["branch", "-D", "feature"]);
+        commit_file(repo_dir.path(), "m.txt", "m", "main moves");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .rebase_onto("main".into(), base, Some(tip.clone()))
+            .await
+            .unwrap();
+
+        let branch = format!("smartlog/{}", &tip[..7]);
+        assert_eq!(
+            git_command_output(
+                repo_dir.path(),
+                ["log", "--format=%s", &format!("main..{branch}")]
+            ),
+            "second\nfirst"
+        );
+        assert_eq!(
+            git_command_output(
+                repo_dir.path(),
+                [
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    KEPT_COMMIT_REF_PREFIX
+                ]
+            ),
+            "",
+            "the branch replaces the kept ref"
         );
     }
 
