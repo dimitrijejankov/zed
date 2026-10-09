@@ -134,10 +134,11 @@ fn submit_label(
 
 impl Smartlog {
     fn sidebar_target(&self) -> Option<Oid> {
-        self.selected_row
-            .and_then(|row| self.layout.rows.get(row))
-            .and_then(|row| row.sha)
-            .or(self.head)
+        match self.selection.len() {
+            0 => self.head,
+            1 => self.selection.iter().next().copied(),
+            _ => None,
+        }
     }
 
     fn sidebar_target_is_public(&self) -> bool {
@@ -879,6 +880,56 @@ impl Smartlog {
         )
     }
 
+    fn render_multi_selection(&self) -> AnyElement {
+        let selected = self.selected_in_display_order();
+        v_flex()
+            .p_3()
+            .gap_3()
+            .child(
+                h_flex().justify_center().child(
+                    Label::new(format!("{} Commits Selected", selected.len()))
+                        .weight(gpui::FontWeight::BOLD),
+                ),
+            )
+            .child(Divider::horizontal())
+            .child(v_flex().gap_2().children(selected.into_iter().map(|sha| {
+                let subject = self.commits.get(&sha).map_or_else(
+                    || SharedString::from("Loading…"),
+                    |commit| commit.subject.clone(),
+                );
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(sha.display_short())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(subject).truncate())
+            })))
+            .into_any_element()
+    }
+
+    fn render_multi_selection_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .flex_none()
+            .w_full()
+            .p_2()
+            .gap_2()
+            .justify_end()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Button::new("smartlog-clear-selection", "Deselect All")
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.selection.clear();
+                        this.selection_anchor = None;
+                        this.sync_sidebar(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn render_sidebar(
         &self,
         _window: &mut Window,
@@ -915,7 +966,9 @@ impl Smartlog {
                     })),
             );
 
+        let multiple_selected = self.selection.len() > 1;
         let content = match target {
+            None if multiple_selected => v_flex().child(self.render_multi_selection()),
             None => v_flex().p_3().child(
                 Label::new("Loading…")
                     .size(LabelSize::Small)
@@ -996,7 +1049,13 @@ impl Smartlog {
                     .overflow_y_scroll()
                     .child(content),
             )
-            .children(self.render_sidebar_actions(cx))
+            .map(|sidebar| {
+                if multiple_selected {
+                    sidebar.child(self.render_multi_selection_actions(cx))
+                } else {
+                    sidebar.children(self.render_sidebar_actions(cx))
+                }
+            })
             .into_any_element()
     }
 }

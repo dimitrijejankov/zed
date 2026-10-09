@@ -456,6 +456,66 @@ fn plan_rebase(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectableRow {
+    sha: Oid,
+    is_public: bool,
+}
+
+/// Applies a click to the commit selection the way ISL does: a plain click selects one commit
+/// (or clears the selection when it is already the only one), cmd-click toggles one, and
+/// shift-click selects the range from the anchor. Trunk commits are never part of a multi-selection.
+fn apply_click(
+    rows: &[SelectableRow],
+    selection: &HashSet<Oid>,
+    anchor: Option<Oid>,
+    clicked: Oid,
+    shift: bool,
+    toggle: bool,
+) -> (HashSet<Oid>, Option<Oid>) {
+    let Some(clicked_row) = rows.iter().find(|row| row.sha == clicked) else {
+        return (selection.clone(), anchor);
+    };
+    let only_clicked = HashSet::from_iter([clicked]);
+
+    if clicked_row.is_public {
+        return (only_clicked, Some(clicked));
+    }
+
+    if shift
+        && let Some(anchor) = anchor
+        && let (Some(from), Some(to)) = (
+            rows.iter().position(|row| row.sha == anchor),
+            rows.iter().position(|row| row.sha == clicked),
+        )
+    {
+        let range = from.min(to)..=from.max(to);
+        let selected = rows[range]
+            .iter()
+            .filter(|row| !row.is_public)
+            .map(|row| row.sha)
+            .collect();
+        return (selected, Some(anchor));
+    }
+
+    if toggle {
+        let mut selected: HashSet<Oid> = rows
+            .iter()
+            .filter(|row| !row.is_public && selection.contains(&row.sha))
+            .map(|row| row.sha)
+            .collect();
+        if !selected.remove(&clicked) {
+            selected.insert(clicked);
+        }
+        return (selected, Some(clicked));
+    }
+
+    if *selection == only_clicked {
+        return (HashSet::default(), None);
+    }
+    (only_clicked, Some(clicked))
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
@@ -470,7 +530,8 @@ pub struct Smartlog {
     segments: Vec<Vec<Segment>>,
     commits: HashMap<Oid, Arc<git::repository::CommitData>>,
     ref_names: HashMap<Oid, Vec<SharedString>>,
-    selected_row: Option<usize>,
+    selection: HashSet<Oid>,
+    selection_anchor: Option<Oid>,
     head: Option<Oid>,
     parents: HashMap<Oid, Option<Oid>>,
     pending_selection: Option<Oid>,
@@ -536,7 +597,8 @@ impl Smartlog {
             segments: Vec::new(),
             commits: HashMap::default(),
             ref_names: HashMap::default(),
-            selected_row: None,
+            selection: HashSet::default(),
+            selection_anchor: None,
             head: None,
             parents: HashMap::default(),
             pending_selection: None,
@@ -596,22 +658,21 @@ impl Smartlog {
         }
         self.parents = drafts.iter().copied().collect();
 
-        let selected_sha = self
-            .selected_row
-            .and_then(|row| self.layout.rows.get(row))
-            .and_then(|row| row.sha);
         self.layout = build_layout(&drafts, head, self.uncommitted_files.len());
         self.segments = row_segments(&self.layout);
-        self.selected_row = selected_sha
-            .and_then(|sha| self.layout.rows.iter().position(|row| row.sha == Some(sha)));
-        if let Some(pending) = self.pending_selection
-            && let Some(row) = self
-                .layout
-                .rows
-                .iter()
-                .position(|row| row.sha == Some(pending))
+        let present: HashSet<Oid> = self.layout.rows.iter().filter_map(|row| row.sha).collect();
+        self.selection.retain(|sha| present.contains(sha));
+        if self
+            .selection_anchor
+            .is_some_and(|anchor| !present.contains(&anchor))
         {
-            self.selected_row = Some(row);
+            self.selection_anchor = None;
+        }
+        if let Some(pending) = self.pending_selection
+            && present.contains(&pending)
+        {
+            self.selection = HashSet::from_iter([pending]);
+            self.selection_anchor = Some(pending);
             self.pending_selection = None;
         }
 
@@ -671,6 +732,49 @@ impl Smartlog {
             anyhow::Ok(())
         })
         .detach_and_prompt_err("Failed to go to commit", window, cx, |_, _, _| None);
+    }
+
+    fn selectable_rows(&self) -> Vec<SelectableRow> {
+        self.layout
+            .rows
+            .iter()
+            .filter_map(|row| {
+                Some(SelectableRow {
+                    sha: row.sha?,
+                    is_public: row.kind == RowKind::Public,
+                })
+            })
+            .collect()
+    }
+
+    /// The selected commits, in the order they are displayed.
+    fn selected_in_display_order(&self) -> Vec<Oid> {
+        self.layout
+            .rows
+            .iter()
+            .filter_map(|row| row.sha)
+            .filter(|sha| self.selection.contains(sha))
+            .collect()
+    }
+
+    fn click_commit(
+        &mut self,
+        sha: Oid,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (selection, anchor) = apply_click(
+            &self.selectable_rows(),
+            &self.selection,
+            self.selection_anchor,
+            sha,
+            modifiers.shift,
+            modifiers.secondary(),
+        );
+        self.selection = selection;
+        self.selection_anchor = anchor;
+        self.sync_sidebar(window, cx);
     }
 
     fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
@@ -1564,7 +1668,7 @@ impl Smartlog {
         if let RowKind::Uncommitted(part) = row.kind {
             return self.render_uncommitted_row(index, row, part, cx);
         }
-        let is_selected = self.selected_row == Some(index);
+        let is_selected = row.sha.is_some_and(|sha| self.selection.contains(&sha));
         let sha = row.sha;
         let rebase_plan = if row.kind == RowKind::Draft && !self.rebase_in_progress(cx) {
             sha.and_then(|sha| self.rebase_plan(sha, cx))
@@ -1705,8 +1809,9 @@ impl Smartlog {
                 )
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.selected_row = Some(index);
-                this.sync_sidebar(window, cx);
+                if let Some(sha) = sha {
+                    this.click_commit(sha, event.modifiers(), window, cx);
+                }
                 if let Some(sha) = sha
                     && event.click_count() == 2
                 {
@@ -2014,6 +2119,60 @@ mod tests {
         let parents = parents_of(&[(a, Some(trunk)), (b, Some(a))]);
 
         assert_eq!(plan_rebase(&parents, Some(b), b, |_| None), None);
+    }
+
+    fn selectable(entries: &[(u8, bool)]) -> Vec<SelectableRow> {
+        entries
+            .iter()
+            .map(|(byte, is_public)| SelectableRow {
+                sha: oid(*byte),
+                is_public: *is_public,
+            })
+            .collect()
+    }
+
+    fn set(bytes: &[u8]) -> HashSet<Oid> {
+        bytes.iter().map(|byte| oid(*byte)).collect()
+    }
+
+    #[test]
+    fn a_plain_click_selects_one_commit_and_a_second_click_clears_it() {
+        let rows = selectable(&[(1, false), (2, false), (3, true)]);
+
+        let (selection, anchor) =
+            apply_click(&rows, &HashSet::default(), None, oid(2), false, false);
+        assert_eq!((selection.clone(), anchor), (set(&[2]), Some(oid(2))));
+
+        let (selection, anchor) = apply_click(&rows, &selection, anchor, oid(2), false, false);
+        assert_eq!((selection, anchor), (HashSet::default(), None));
+    }
+
+    #[test]
+    fn toggling_adds_and_removes_commits() {
+        let rows = selectable(&[(1, false), (2, false), (3, false)]);
+
+        let (selection, anchor) = apply_click(&rows, &set(&[1]), Some(oid(1)), oid(3), false, true);
+        assert_eq!(selection, set(&[1, 3]));
+
+        let (selection, _) = apply_click(&rows, &selection, anchor, oid(1), false, true);
+        assert_eq!(selection, set(&[3]));
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_the_anchor_without_trunk_commits() {
+        let rows = selectable(&[(1, false), (2, true), (3, false), (4, false)]);
+
+        let (selection, anchor) = apply_click(&rows, &set(&[1]), Some(oid(1)), oid(4), true, false);
+        assert_eq!(selection, set(&[1, 3, 4]));
+        assert_eq!(anchor, Some(oid(1)));
+    }
+
+    #[test]
+    fn clicking_a_trunk_commit_selects_only_it() {
+        let rows = selectable(&[(1, false), (2, true)]);
+
+        let (selection, _) = apply_click(&rows, &set(&[1]), Some(oid(1)), oid(2), false, true);
+        assert_eq!(selection, set(&[2]));
     }
 
     #[test]
