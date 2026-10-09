@@ -48,6 +48,7 @@ use git::repository::RepoPath;
 use git_ui_core::askpass_modal::AskPassModal;
 use workspace::{Toast, notifications::NotificationId};
 
+mod bookmarks;
 mod persistence;
 mod sidebar;
 
@@ -953,6 +954,8 @@ pub struct Smartlog {
     list_scroll_handle: ScrollHandle,
     head: Option<Oid>,
     parents: HashMap<Oid, Option<Oid>>,
+    /// Every commit in the draft log, including hidden ones, unlike `parents`.
+    all_draft_shas: HashSet<Oid>,
     hidden: HashSet<Oid>,
     hidden_closure: HashSet<Oid>,
     protected_from_hiding: HashSet<Oid>,
@@ -1046,6 +1049,7 @@ impl Smartlog {
             list_scroll_handle: ScrollHandle::new(),
             head: None,
             parents: HashMap::default(),
+            all_draft_shas: HashSet::default(),
             hidden: HashSet::default(),
             hidden_closure: HashSet::default(),
             protected_from_hiding: HashSet::default(),
@@ -1113,6 +1117,7 @@ impl Smartlog {
         }
 
         let all_parents: HashMap<Oid, Option<Oid>> = drafts.iter().copied().collect();
+        self.all_draft_shas = all_parents.keys().copied().collect();
         self.hidden = draft_commits
             .iter()
             .filter(|commit| {
@@ -1791,6 +1796,58 @@ impl Smartlog {
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    fn goto_bookmark(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let task = cx.spawn_in(window, async move |_, cx| {
+            repository
+                .update(cx, |repository, _| repository.change_branch(name))
+                .await??;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to go to bookmark", task, window, cx);
+    }
+
+    fn delete_bookmarks(
+        &mut self,
+        names: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        if names.is_empty() {
+            return;
+        }
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &if names.len() == 1 {
+                format!("Delete the bookmark {}?", names[0])
+            } else {
+                format!("Delete {} bookmarks?", names.len())
+            },
+            Some("The commits stay in git if another branch still contains them."),
+            &["Delete", "Cancel"],
+            cx,
+        );
+        let task = cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+            for name in names {
+                repository
+                    .update(cx, |repository, _| {
+                        repository.delete_branch(false, name, true)
+                    })
+                    .await??;
+            }
+            Ok(())
+        });
+        self.run_logged("Failed to delete bookmarks", task, window, cx);
     }
 
     fn hide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
@@ -3209,6 +3266,24 @@ impl Render for Smartlog {
             .child(
                 h_flex()
                     .gap_2()
+                    .child(
+                        IconButton::new("smartlog-bookmarks", IconName::Bookmark)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Manage bookmarks"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let Some(repository) = this.repository(cx) else {
+                                    return;
+                                };
+                                let smartlog = cx.weak_entity();
+                                this.workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.toggle_modal(window, cx, |_, cx| {
+                                            bookmarks::BookmarksModal::new(smartlog, repository, cx)
+                                        });
+                                    })
+                                    .log_err();
+                            })),
+                    )
                     .child(
                         IconButton::new("smartlog-goto-time", IconName::Clock)
                             .icon_size(IconSize::Small)
