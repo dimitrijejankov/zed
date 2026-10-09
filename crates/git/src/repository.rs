@@ -3235,6 +3235,12 @@ impl GitRepository for RealGitRepository {
         self.executor
             .spawn(async move {
                 let git = git?;
+                anyhow::ensure!(
+                    git.run(&["merge-base", "--is-ancestor", &branch, "HEAD"])
+                        .await
+                        .is_err(),
+                    "{branch} is already merged into the checked-out branch, so there is nothing to merge"
+                );
                 run_rebase_command(
                     &git,
                     &[
@@ -9791,6 +9797,16 @@ mod tests {
         assert!(error.contains("CONFLICT"), "{error}");
         assert!(repo_dir.path().join(".git/MERGE_HEAD").exists());
 
+        assert!(
+            repository
+                .merge_branch("clean".into())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already merged"),
+            "merging what is already merged says so"
+        );
+
         repository.merge_abort().await.unwrap();
         assert!(!repo_dir.path().join(".git/MERGE_HEAD").exists());
         assert_eq!(
@@ -9809,6 +9825,32 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["show", "HEAD:f.txt"]),
             "resolved"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merging_a_branch_into_one_behind_it_fast_forwards(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "f.txt", "base", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        commit_file(repo_dir.path(), "a.txt", "a", "first");
+        let tip = commit_file(repo_dir.path(), "b.txt", "b", "second");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository.change_branch("main".into()).await.unwrap();
+        repository.merge_branch("feature".into()).await.unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            tip
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["symbolic-ref", "HEAD"]),
+            "refs/heads/main"
         );
     }
 

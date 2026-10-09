@@ -2238,6 +2238,32 @@ impl Smartlog {
                         }
                     })
                 })
+                .when(can_merge, |menu| {
+                    menu.submenu("Merge Current Branch Into", {
+                        let smartlog = smartlog.clone();
+                        let branches: Vec<String> = all_branches
+                            .iter()
+                            .filter(|name| Some(*name) != current_branch.as_ref())
+                            .cloned()
+                            .collect();
+                        move |mut menu, _, _| {
+                            for name in &branches {
+                                menu = menu.entry(name.clone(), None, {
+                                    let smartlog = smartlog.clone();
+                                    let name = name.clone();
+                                    move |window, cx| {
+                                        smartlog
+                                            .update(cx, |this, cx| {
+                                                this.merge_current_into(name.clone(), window, cx)
+                                            })
+                                            .log_err();
+                                    }
+                                });
+                            }
+                            menu
+                        }
+                    })
+                })
                 .submenu("Set Trunk", {
                     let smartlog = smartlog.clone();
                     move |mut menu, _, _| {
@@ -3192,6 +3218,54 @@ impl Smartlog {
             .branch
             .as_ref()
             .map(|branch| branch.name().to_string())
+    }
+
+    /// Checks out `target` and merges the branch that was checked out into it, which is the way
+    /// to land a branch on `main`.
+    fn merge_current_into(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rebase_in_progress(cx) || self.merge_in_progress(cx) {
+            return;
+        }
+        let (Some(current), Some(repository)) = (self.current_branch(cx), self.repository(cx))
+        else {
+            return;
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Merge {current} into {target}?"),
+            Some(&format!("{target} will be checked out.")),
+            &["Merge", "Cancel"],
+            cx,
+        );
+        let workspace = self.workspace.clone();
+        let task = cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+            repository
+                .update(cx, |repository, _| repository.change_branch(target.clone()))
+                .await??;
+            let result = repository
+                .update(cx, |repository, cx| {
+                    repository.merge_branch(current.clone(), cx)
+                })
+                .await?;
+            let merged = result.is_ok();
+            report_rebase_conflicts(&workspace, result, "Merge", cx)?;
+            if merged {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<Smartlog>(),
+                            format!("Merged {current} into {target}"),
+                        ),
+                        cx,
+                    );
+                })?;
+            }
+            Ok(())
+        });
+        self.run_logged("Failed to merge", task, window, cx);
     }
 
     fn merge_into_current(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {

@@ -137,6 +137,7 @@ Right-click a commit, or select several, for these actions:
 - **Hide** removes a commit and everything built on it from the view without deleting it. Hidden commits can be shown again from the header.
 - **Switch to** and **Merge into** appear for commits with a local branch. Switch checks the branch out, and Goto does the same for a commit that has one, so `HEAD` isn't left detached. Merge merges the branch into the checked-out one. If it stops on conflicts, the banner offers Continue and Abort.
 - **Switch Branch** and **Merge Branch Into Current** list every local branch from any commit's menu, so you can change the checked-out branch without finding its commit first. The checked-out branch is ticked.
+- **Merge Current Branch Into** checks out the chosen branch and merges the branch you were on into it, which is how a branch lands on `main`. Merging something that is already merged reports that instead of doing nothing.
 - **Set Trunk** chooses which branch counts as the trunk, such as `main`, `master` or `develop`. Everything built on it is shown as drafts. The choice is saved with the tab.
 - **Create Bookmark** makes a branch at a commit without switching to it, and the bookmarks button lists, switches and deletes them.
 - **Download Commits** fetches a branch, tag, commit or pull request number from the default remote.
