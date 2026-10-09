@@ -544,6 +544,29 @@ fn plan_drag_rebase(
     (!moved.contains(&target) && target != plan.old_base).then_some(plan)
 }
 
+/// The branches a trunk can be chosen from: the usual names for a main line first, then the rest
+/// alphabetically. The current trunk is always listed, even when it is not a local branch.
+fn trunk_candidates(mut names: Vec<String>, current: &str) -> Vec<(String, bool)> {
+    const USUAL: [&str; 4] = ["main", "master", "develop", "trunk"];
+    if !names.iter().any(|name| name == current) {
+        names.push(current.to_string());
+    }
+    names.sort();
+    names.dedup();
+    let (mut usual, rest): (Vec<String>, Vec<String>) = names
+        .into_iter()
+        .partition(|name| USUAL.contains(&name.as_str()));
+    usual.sort_by_key(|name| USUAL.iter().position(|usual| usual == name));
+    usual
+        .into_iter()
+        .chain(rest)
+        .map(|name| {
+            let is_current = name == current;
+            (name, is_current)
+        })
+        .collect()
+}
+
 /// Why dropping `source` onto `target` can't be turned into a rebase, for when
 /// `plan_drag_rebase` finds none.
 fn drag_rebase_refusal(
@@ -1966,6 +1989,7 @@ impl Smartlog {
             && !self.selected_paths().is_empty()
             && !self.rebase_in_progress(cx);
         let trunk = self.trunk.clone();
+        let trunk_choices = self.trunk_choices(cx);
         let copy_text = self.copy_hash_text(sha);
         let smartlog = cx.entity().downgrade();
         let workspace = self.workspace.clone();
@@ -2098,6 +2122,31 @@ impl Smartlog {
                                 );
                             })
                             .log_err();
+                    }
+                })
+                .submenu("Set Trunk", {
+                    let smartlog = smartlog.clone();
+                    move |mut menu, _, _| {
+                        for (name, is_trunk) in &trunk_choices {
+                            menu = menu.toggleable_entry(
+                                name.clone(),
+                                *is_trunk,
+                                IconPosition::Start,
+                                None,
+                                {
+                                    let smartlog = smartlog.clone();
+                                    let name = name.clone();
+                                    move |window, cx| {
+                                        smartlog
+                                            .update(cx, |this, cx| {
+                                                this.set_trunk(name.clone().into(), window, cx)
+                                            })
+                                            .log_err();
+                                    }
+                                },
+                            );
+                        }
+                        menu
                     }
                 })
                 .when(
@@ -2319,6 +2368,35 @@ impl Smartlog {
 
     /// What to rebase for a stack ending at `tip`: its branch, or the commit itself for a stack
     /// that only a kept ref holds up.
+    fn trunk_choices(&self, cx: &App) -> Vec<(String, bool)> {
+        let names = self
+            .repository(cx)
+            .map(|repository| {
+                repository
+                    .read(cx)
+                    .branch_list
+                    .iter()
+                    .filter(|branch| !branch.is_remote())
+                    .map(|branch| branch.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        trunk_candidates(names, &self.trunk)
+    }
+
+    /// Treats `trunk` as the public line from now on: what is built on it is shown as drafts, and
+    /// rebases and Go to Time use it. The choice is saved with the tab.
+    fn set_trunk(&mut self, trunk: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        if self.trunk == trunk {
+            return;
+        }
+        self.trunk = trunk;
+        self.selection.clear();
+        self.selection_anchor = None;
+        cx.emit(ItemEvent::Edit);
+        self.refresh(window, cx);
+    }
+
     fn rebase_target_at(&self, tip: Oid, cx: &App) -> Option<String> {
         Some(
             self.local_branch_at(tip, cx)
@@ -5002,6 +5080,31 @@ mod tests {
     }
 
     #[test]
+    fn trunk_candidates_put_the_usual_names_first_and_mark_the_current_one() {
+        let names = ["zeta", "develop", "main", "feature", "master"]
+            .map(String::from)
+            .to_vec();
+        let candidates = trunk_candidates(names, "master");
+        let listed: Vec<&str> = candidates.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(listed, ["main", "master", "develop", "feature", "zeta"]);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|(_, current)| *current)
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["master"]
+        );
+
+        let with_remote_trunk = trunk_candidates(vec!["main".into()], "origin/main");
+        assert!(
+            with_remote_trunk
+                .iter()
+                .any(|(name, current)| name == "origin/main" && *current)
+        );
+    }
+
+    #[test]
     fn a_refused_drop_says_why() {
         let (trunk, a, b, c, d) = (oid(1), oid(2), oid(3), oid(4), oid(5));
         let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (c, Some(b)), (d, Some(b))]);
@@ -6029,5 +6132,100 @@ mod tests {
             ],
         );
         assert_eq!(moved, "temporary");
+    }
+
+    #[gpui::test]
+    async fn setting_another_branch_as_the_trunk_changes_what_counts_as_a_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fs::RealFs;
+        use project::Project;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        run_git(path, &["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("f.txt"), "base\n").unwrap();
+        run_git(path, &["add", "f.txt"]);
+        run_git(path, &["commit", "-qm", "base"]);
+        run_git(path, &["switch", "-qc", "develop"]);
+        std::fs::write(path.join("d.txt"), "d\n").unwrap();
+        run_git(path, &["add", "d.txt"]);
+        run_git(path, &["commit", "-qm", "on develop"]);
+        run_git(path, &["switch", "-qc", "feature"]);
+        std::fs::write(path.join("e.txt"), "e\n").unwrap();
+        run_git(path, &["add", "e.txt"]);
+        run_git(path, &["commit", "-qm", "on feature"]);
+
+        let project = Project::test(RealFs::new(None, cx.executor()), [path], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+
+        #[allow(clippy::disallowed_methods)]
+        let wait_for_drafts = |cx: &mut gpui::VisualTestContext, count: usize| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                let drafts = smartlog.read_with(&*cx, |smartlog, _| {
+                    smartlog
+                        .layout
+                        .rows
+                        .iter()
+                        .filter(|row| row.kind == RowKind::Draft)
+                        .count()
+                });
+                if drafts == count {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(wait_for_drafts(cx, 2), "both commits are drafts above main");
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.set_trunk("develop".into(), window, cx);
+        });
+        assert!(
+            wait_for_drafts(cx, 1),
+            "with develop as the trunk only the feature commit is a draft"
+        );
+        smartlog.read_with(&*cx, |smartlog, cx| {
+            let choices = smartlog.trunk_choices(cx);
+            assert!(
+                choices
+                    .iter()
+                    .any(|(name, current)| name == "develop" && *current)
+            );
+            assert!(
+                choices
+                    .iter()
+                    .any(|(name, current)| name == "main" && !*current)
+            );
+        });
     }
 }

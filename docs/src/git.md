@@ -135,6 +135,7 @@ Right-click a commit, or select several, for these actions:
 - **Fold** combines selected commits, **Split** divides a commit by file, hunk or line. As with `git add -p`, added lines of a hunk are placed after its removed lines, and **Amend Changes to Here** adds your uncommitted changes to an older commit.
 - **Submit Stack** pushes every branch in a stack to the default remote.
 - **Hide** removes a commit and everything built on it from the view without deleting it. Hidden commits can be shown again from the header.
+- **Set Trunk** chooses which branch counts as the trunk, such as `main`, `master` or `develop`. Everything built on it is shown as drafts. The choice is saved with the tab.
 - **Create Bookmark** makes a branch at a commit without switching to it, and the bookmarks button lists, switches and deletes them.
 - **Download Commits** fetches a branch, tag, commit or pull request number from the default remote.
 
