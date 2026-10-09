@@ -108,6 +108,59 @@ See [Configuring Zed](./configuring-zed.md) for more about the Settings Editor.
 
 You can switch between modes at any time. Your preference applies to [Project Diff](#project-diff), [File History](#file-history), and [Stash Diff View](#stash-diff-view). These diff views function as [multibuffers](./multibuffers.md), allowing you to edit multiple excerpts simultaneously.
 
+## Smartlog {#smartlog}
+
+The Smartlog shows the work you have in flight, modeled on the Interactive Smartlog from [Sapling](https://sapling-scm.com/docs/addons/isl). Open it with {#action smartlog::Open}, or with the graph button in the Git Panel.
+
+It lists only your _draft_ commits: those reachable from your local branches that are not yet on the trunk branch, which is the repository's default branch. Each stack of drafts branches off the trunk commit it is based on, the checked-out commit is marked "You are here", and your uncommitted changes sit directly above it.
+
+### Working with Uncommitted Changes {#smartlog-uncommitted}
+
+Every changed file has a checkbox, all checked by default. Commit, Amend, Shelve and Discard act only on the checked files. Commit takes its message from the title field next to it.
+
+- **Commit** creates a commit from the checked files. An empty title becomes "Temporary Commit at" followed by the time.
+- **Amend** adds the checked files to the current commit and keeps its message.
+- **Absorb** folds each change into the commit of your stack that last touched those lines, after showing you where each one goes. Changes that touch lines from several commits stay uncommitted.
+- **Shelve** stashes the checked files. Shelved changes are listed below the commits, where you can unshelve or delete them.
+
+Clicking a file opens its diff.
+
+### Working with Commits {#smartlog-commits}
+
+Right-click a commit, or select several, for these actions:
+
+- Go to a commit, or to the trunk commit from a given time with **Go to Time**.
+- **Rebase** a stack onto the trunk, or drag a commit onto another commit to move it and everything built on it. If a rebase stops on conflicts, resolve them and choose Continue in the banner, or Abort.
+- **Edit Stack** reorders, drops or combines the commits of a straight stack. The commits are merged in memory, so nothing changes if the new order conflicts.
+- **Fold** combines selected commits, **Split** divides a commit by file, and **Amend Changes to Here** adds your uncommitted changes to an older commit.
+- **Hide** removes a commit and everything built on it from the view without deleting it. Hidden commits can be shown again from the header.
+- **Create Bookmark** makes a branch at a commit without switching to it, and the bookmarks button lists, switches and deletes them.
+- **Download Commits** fetches a branch, tag, commit or pull request number from the default remote.
+
+### Commit Info {#smartlog-commit-info}
+
+The sidebar shows the selected commit, or the checked-out one when nothing is selected. Edit the title and description and choose Amend Message to rewrite them, which also works for commits that are not checked out. For the checked-out commit you can switch between amending it and writing a new commit, and Submit pushes its branch to the default remote.
+
+### Smartlog Settings {#smartlog-settings}
+
+The gear button toggles: opening diffs when clicking a file name, compact rows, scrolling to the current commit on open, copying short hashes, and confirming before a rebase onto the trunk. The settings are saved with the tab.
+
+### Smartlog Keybindings {#smartlog-keybindings}
+
+| Action                                   | Keybinding                           |
+| ---------------------------------------- | ------------------------------------ |
+| {#action smartlog::SelectPreviousCommit} | {#kb smartlog::SelectPreviousCommit} |
+| {#action smartlog::SelectNextCommit}     | {#kb smartlog::SelectNextCommit}     |
+| {#action smartlog::ExtendSelectionUp}    | {#kb smartlog::ExtendSelectionUp}    |
+| {#action smartlog::ExtendSelectionDown}  | {#kb smartlog::ExtendSelectionDown}  |
+| {#action smartlog::ClearSelection}       | {#kb smartlog::ClearSelection}       |
+| {#action smartlog::SelectAllCommits}     | {#kb smartlog::SelectAllCommits}     |
+| {#action smartlog::HideSelectedCommits}  | {#kb smartlog::HideSelectedCommits}  |
+| {#action smartlog::ToggleSidebar}        | {#kb smartlog::ToggleSidebar}        |
+| {#action smartlog::FocusFilter}          | {#kb smartlog::FocusFilter}          |
+| {#action smartlog::Pull}                 | {#kb smartlog::Pull}                 |
+| {#action smartlog::RebaseOntoTrunk}      | {#kb smartlog::RebaseOntoTrunk}      |
+
 ## File History
 
 File History shows the commit history for an individual file. Each entry displays the commit's author, timestamp, and message. Selecting a commit opens a diff view filtered to show only the changes made to that file in that commit.
