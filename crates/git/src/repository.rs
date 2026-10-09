@@ -795,6 +795,21 @@ impl LogOrder {
     }
 }
 
+async fn read_rebase_original_head(git_directory: &Path) -> Option<String> {
+    for directory in ["rebase-merge", "rebase-apply"] {
+        let contents = smol::fs::read_to_string(git_directory.join(directory).join("orig-head"))
+            .await
+            .ok();
+        if let Some(contents) = contents {
+            let original_head = contents.trim();
+            if !original_head.is_empty() {
+                return Some(original_head.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum LogSource {
     #[default]
@@ -3718,8 +3733,21 @@ impl GitRepository for RealGitRepository {
     ) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary();
 
+        let git_directory = self.path();
+
         async move {
-            let log_source_args = log_source.get_args();
+            let mut log_source_args = log_source.get_args();
+            if matches!(log_source, LogSource::Draft(_)) {
+                // A rebase of a detached HEAD leaves the commits it is replaying reachable only
+                // through this file, so without it they would vanish from the log until it ends.
+                if let Some(original_head) = read_rebase_original_head(&git_directory).await {
+                    let insert_at = log_source_args
+                        .iter()
+                        .position(|arg| arg == "--not")
+                        .unwrap_or(log_source_args.len());
+                    log_source_args.insert(insert_at, Cow::Owned(original_head));
+                }
+            }
             let mut git_log_command = vec!["log", GRAPH_COMMIT_FORMAT, log_order.as_arg()];
             git_log_command.extend(log_source_args.iter().map(|arg| arg.as_ref()));
             let mut command = git.build_command(&git_log_command);
@@ -8538,6 +8566,55 @@ mod tests {
                 .fold_commits(vec![only], "folded".to_string())
                 .await
                 .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_draft_log_keeps_commits_being_rebased_off_a_detached_head(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "f.txt", "base", "base");
+        git_command(repo_dir.path(), ["switch", "--detach"]);
+        commit_file(repo_dir.path(), "a.txt", "a", "one");
+        commit_file(repo_dir.path(), "f.txt", "feature", "two conflicts");
+        let tip = commit_file(repo_dir.path(), "c.txt", "c", "three");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        commit_file(repo_dir.path(), "f.txt", "main", "main moves");
+        git_command(repo_dir.path(), ["switch", "--detach", tip.as_str()]);
+        #[allow(clippy::disallowed_methods)]
+        let rebase = smol::process::Command::new("git")
+            .args(["rebase", "--onto", "main", base.as_str()])
+            .env("GIT_EDITOR", "true")
+            .current_dir(repo_dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(!rebase.status.success(), "the rebase should hit a conflict");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let (sender, receiver) = smol::channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::Draft("main".into()), LogOrder::DateOrder, sender)
+            .await
+            .unwrap();
+        let mut commits = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            commits.extend(chunk);
+        }
+        assert!(
+            commits.iter().any(|commit| commit.sha.to_string() == tip),
+            "the commits being replayed must stay in the log, got {} commits",
+            commits.len()
+        );
+        assert_eq!(
+            commits.len(),
+            4,
+            "three original commits and the replayed first"
         );
     }
 

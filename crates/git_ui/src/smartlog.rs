@@ -5423,4 +5423,202 @@ mod tests {
         });
         draw(cx);
     }
+
+    #[allow(clippy::disallowed_methods)]
+    fn run_git(directory: &std::path::Path, arguments: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .env("GIT_EDITOR", "true")
+            .output()
+            .expect("failed to run git");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Runs the real git store against a real repository, because the fake one can't show what
+    /// the commit graph looks like while a rebase is in the middle of rewriting it.
+    #[gpui::test]
+    async fn every_stack_stays_visible_while_one_is_being_rebased(cx: &mut gpui::TestAppContext) {
+        use fs::RealFs;
+        use project::Project;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        run_git(path, &["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("f.txt"), "base\n").unwrap();
+        run_git(path, &["add", "f.txt"]);
+        run_git(path, &["commit", "-qm", "base"]);
+        let base = run_git(path, &["rev-parse", "HEAD"]);
+
+        run_git(path, &["switch", "-qc", "other"]);
+        std::fs::write(path.join("o1.txt"), "o1\n").unwrap();
+        run_git(path, &["add", "o1.txt"]);
+        run_git(path, &["commit", "-qm", "other one"]);
+        std::fs::write(path.join("o2.txt"), "o2\n").unwrap();
+        run_git(path, &["add", "o2.txt"]);
+        run_git(path, &["commit", "-qm", "other two"]);
+
+        run_git(path, &["switch", "-qc", "feature", &base]);
+        std::fs::write(path.join("a.txt"), "a\n").unwrap();
+        run_git(path, &["add", "a.txt"]);
+        run_git(path, &["commit", "-qm", "feature one"]);
+        std::fs::write(path.join("f.txt"), "feature change\n").unwrap();
+        run_git(path, &["commit", "-qam", "feature two conflicts"]);
+        std::fs::write(path.join("c.txt"), "c\n").unwrap();
+        run_git(path, &["add", "c.txt"]);
+        run_git(path, &["commit", "-qm", "feature three"]);
+
+        run_git(path, &["switch", "-q", "main"]);
+        std::fs::write(path.join("f.txt"), "main change\n").unwrap();
+        run_git(path, &["commit", "-qam", "main moves"]);
+        run_git(path, &["switch", "-q", "feature"]);
+
+        let project = Project::test(RealFs::new(None, cx.executor()), [path], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+
+        #[allow(clippy::disallowed_methods)]
+        let wait_for = |cx: &mut gpui::VisualTestContext, condition: &dyn Fn(&Smartlog) -> bool| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                if smartlog.read_with(&*cx, |smartlog, _| condition(smartlog)) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            false
+        };
+        let draft_subjects = |cx: &mut gpui::VisualTestContext| -> Vec<String> {
+            smartlog.read_with(&*cx, |smartlog, _| {
+                smartlog
+                    .layout
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind == RowKind::Draft)
+                    .filter_map(|row| row.sha)
+                    .filter_map(|sha| smartlog.commits.get(&sha))
+                    .map(|commit| commit.subject.to_string())
+                    .collect()
+            })
+        };
+
+        assert!(
+            wait_for(cx, &|smartlog| smartlog
+                .layout
+                .rows
+                .iter()
+                .filter(|row| row.kind == RowKind::Draft)
+                .count()
+                == 5
+                && smartlog.commits.len() >= 5),
+            "all five draft commits should be shown before the rebase: {:?}",
+            draft_subjects(cx)
+        );
+
+        let plan = smartlog
+            .read_with(&*cx, |smartlog, cx| smartlog.head_rebase_plan(cx))
+            .expect("the checked-out stack can be rebased");
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.rebase_stack(plan, window, cx);
+        });
+
+        #[allow(clippy::disallowed_methods)]
+        let stopped = {
+            let mut stopped = false;
+            for _ in 0..200 {
+                cx.run_until_parked();
+                if repository.read_with(&*cx, |repository, _| repository.merge.rebase_in_progress) {
+                    stopped = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            stopped
+        };
+        assert!(stopped, "the rebase should stop on the conflict");
+        // Give the draft log time to reload after the head moved.
+        wait_for(cx, &|smartlog| {
+            smartlog
+                .layout
+                .rows
+                .iter()
+                .filter(|row| row.kind == RowKind::Draft)
+                .count()
+                >= 6
+        });
+
+        let subjects = draft_subjects(cx);
+        for subject in [
+            "other one",
+            "other two",
+            "feature one",
+            "feature two conflicts",
+            "feature three",
+        ] {
+            assert!(
+                subjects.iter().any(|candidate| candidate == subject),
+                "{subject:?} disappeared during the rebase: {subjects:?}"
+            );
+        }
+        assert!(
+            subjects.len() >= 6,
+            "the replayed commit should be shown too: {subjects:?}"
+        );
+
+        // Resolve the conflict and continue instead of aborting.
+        std::fs::write(path.join("f.txt"), "resolved\n").unwrap();
+        run_git(path, &["add", "f.txt"]);
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.continue_rebase(window, cx)
+        });
+        #[allow(clippy::disallowed_methods)]
+        {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                if !repository.read_with(&*cx, |repository, _| repository.merge.rebase_in_progress)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            for _ in 0..40 {
+                cx.run_until_parked();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        let after_continue = draft_subjects(cx);
+        assert_eq!(after_continue.len(), 5, "{after_continue:?}");
+    }
 }
