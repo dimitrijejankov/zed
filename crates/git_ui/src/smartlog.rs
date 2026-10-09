@@ -1258,15 +1258,22 @@ impl Smartlog {
         let Some(repository) = self.repository(cx) else {
             return;
         };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let fs = workspace.read(cx).project().read(cx).fs().clone();
+        let workspace = self.workspace.clone();
         let path = repository
             .read(cx)
             .repository_dir_abs_path
             .join("FETCH_HEAD");
+        // The workspace is read from inside the task because this can run while the workspace
+        // itself is being updated, such as when the Smartlog is first opened.
         self.last_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let Some(fs) = workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.project().read(cx).fs().clone()
+                })
+                .log_err()
+            else {
+                return;
+            };
             let modified = fs
                 .metadata(&path)
                 .await
@@ -4859,6 +4866,67 @@ mod tests {
         cx.run_until_parked();
         smartlog.read_with(&*cx, |smartlog, _| {
             assert_eq!(smartlog.operations.len(), MAX_OPERATION_HISTORY);
+        });
+    }
+
+    #[gpui::test]
+    async fn the_smartlog_can_be_created_while_the_workspace_is_updating(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fs::FakeFs;
+        use project::Project;
+        use serde_json::json;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new("/project"), json!({ ".git": {}, "a.txt": "a" }))
+            .await;
+        fs.set_head_and_index_for_repo(Path::new("/project/.git"), &[("a.txt", "a".to_string())]);
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+
+        let repository_id = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("repository")
+                .read(cx)
+                .id
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+
+        // Opening the Smartlog creates it from inside an update of the workspace, so nothing
+        // done while constructing it may read the workspace.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            let workspace_handle = workspace.weak_handle();
+            let smartlog = cx.new(|cx| {
+                Smartlog::new(
+                    repository_id,
+                    git_store,
+                    workspace_handle,
+                    "main".into(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.add_item_to_active_pane(Box::new(smartlog), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&*cx, |workspace, cx| {
+            assert!(workspace.active_item_as::<Smartlog>(cx).is_some());
         });
     }
 }
