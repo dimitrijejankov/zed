@@ -590,7 +590,7 @@ impl SplitState {
 actions!(
     git_graph,
     [
-        /// Opens the Git Graph Tab.
+        /// Opens the Smartlog, which replaces the Git Graph for the whole repository.
         Open,
         /// Focuses the search field.
         FocusSearch,
@@ -1116,26 +1116,11 @@ pub fn init(cx: &mut App) {
                     div.on_action({
                         let workspace = workspace.clone();
                         move |_: &Open, window, cx| {
+                            // The Smartlog replaces the whole-repository graph. The graph item
+                            // remains for browsing the history of a file or an arbitrary commit.
                             workspace
                                 .update(cx, |workspace, cx| {
-                                    let Some(repo) =
-                                        workspace.project().read(cx).active_repository(cx)
-                                    else {
-                                        return;
-                                    };
-                                    let selected_repo_id = repo.read(cx).id;
-
-                                    let git_store =
-                                        workspace.project().read(cx).git_store().clone();
-                                    open_or_reuse_graph(
-                                        workspace,
-                                        selected_repo_id,
-                                        git_store,
-                                        LogSource::All,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
+                                    crate::smartlog::open(workspace, window, cx);
                                 })
                                 .ok();
                         }

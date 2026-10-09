@@ -7164,7 +7164,7 @@ impl GitPanel {
                                 .icon_size(IconSize::Small)
                                 .tooltip(|_window, cx| {
                                     Tooltip::for_action(
-                                        "Open Git Graph",
+                                        "Open Smartlog",
                                         &crate::git_graph::Open,
                                         cx,
                                     )

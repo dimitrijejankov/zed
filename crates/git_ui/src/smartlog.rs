@@ -113,7 +113,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+pub(crate) fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
         return;
     };
