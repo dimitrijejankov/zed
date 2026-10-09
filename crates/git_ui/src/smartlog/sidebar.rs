@@ -64,6 +64,7 @@ pub(super) struct SidebarState {
     diff_stats: Option<(usize, usize)>,
     diff_task: Option<Task<()>>,
     load_public_files: bool,
+    files_as_tree: bool,
 }
 
 impl SidebarState {
@@ -92,6 +93,7 @@ impl SidebarState {
             diff_stats: None,
             diff_task: None,
             load_public_files: false,
+            files_as_tree: false,
         }
     }
 }
@@ -665,15 +667,50 @@ impl Smartlog {
         let files: Vec<AnyElement> = match (&self.sidebar.diff, self.repository(cx)) {
             (Some(diff), Some(repository)) => {
                 let mut files: Vec<_> = diff.files.iter().collect();
-                files.sort_by_key(|file| file.status());
-                files
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, file)| {
-                        let entry = ChangedFileEntry::from_commit_file(file, cx);
-                        let directory =
-                            (!entry.dir_path.is_empty()).then(|| entry.dir_path.clone());
-                        entry.render(
+                let as_tree = self.sidebar.files_as_tree;
+                if as_tree {
+                    files.sort_by(|a, b| a.path.cmp(&b.path));
+                } else {
+                    files.sort_by_key(|file| file.status());
+                }
+                let mut previous_directory: Option<SharedString> = None;
+                let mut elements = Vec::new();
+                for (index, file) in files.into_iter().enumerate() {
+                    let entry = ChangedFileEntry::from_commit_file(file, cx);
+                    let directory = (!entry.dir_path.is_empty()).then(|| entry.dir_path.clone());
+                    if as_tree {
+                        if previous_directory != directory {
+                            if let Some(directory) = directory.clone() {
+                                elements.push(
+                                    h_flex()
+                                        .px_1()
+                                        .gap_1()
+                                        .child(
+                                            Icon::new(IconName::Folder)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new(directory)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .into_any_element(),
+                                );
+                            }
+                            previous_directory = directory.clone();
+                        }
+                        elements.push(entry.render(
+                            index,
+                            usize::from(directory.is_some()),
+                            None,
+                            sha.to_string().into(),
+                            repository.downgrade(),
+                            self.workspace.clone(),
+                            cx,
+                        ));
+                    } else {
+                        elements.push(entry.render(
                             index,
                             0,
                             directory,
@@ -681,9 +718,10 @@ impl Smartlog {
                             repository.downgrade(),
                             self.workspace.clone(),
                             cx,
-                        )
-                    })
-                    .collect()
+                        ));
+                    }
+                }
+                elements
             }
             _ => Vec::new(),
         };
@@ -722,6 +760,26 @@ impl Smartlog {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_commit(sha, window, cx);
                             })),
+                    )
+                    .child(
+                        IconButton::new(
+                            "smartlog-files-view-mode",
+                            if self.sidebar.files_as_tree {
+                                IconName::ListTree
+                            } else {
+                                IconName::ListCollapse
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text(if self.sidebar.files_as_tree {
+                            "Show files as a flat list"
+                        } else {
+                            "Group files by folder"
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar.files_as_tree = !this.sidebar.files_as_tree;
+                            cx.notify();
+                        })),
                     )
                     .child(
                         Button::new("smartlog-open-all-files", "Open All Files")
