@@ -19,7 +19,11 @@ use project::git_store::{
     CommitDataState, GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
     StatusEntry,
 };
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use time::OffsetDateTime;
 use time_format::TimestampFormat;
 use ui::{
@@ -797,6 +801,17 @@ impl Render for GotoTimeModal {
     }
 }
 
+/// How long ago something happened, as short as ISL's Pull badge: `now`, `5m`, `2h` or `3d`.
+fn short_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..60 => "now".to_string(),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86_400 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
@@ -943,6 +958,8 @@ pub struct Smartlog {
     protected_from_hiding: HashSet<Oid>,
     show_hidden: bool,
     shelf_collapsed: bool,
+    last_fetch: Option<SystemTime>,
+    last_fetch_task: Option<Task<()>>,
     operations: VecDeque<OperationRecord>,
     next_operation_id: u64,
     history_expanded: bool,
@@ -1034,6 +1051,8 @@ impl Smartlog {
             protected_from_hiding: HashSet::default(),
             show_hidden: false,
             shelf_collapsed: false,
+            last_fetch: None,
+            last_fetch_task: None,
             operations: VecDeque::new(),
             next_operation_id: 0,
             history_expanded: false,
@@ -1136,8 +1155,38 @@ impl Smartlog {
             self.load_commit(&repository, sha, window, cx);
         }
         self.sync_sidebar(window, cx);
+        self.update_last_fetch(cx);
         cx.emit(ItemEvent::Edit);
         cx.notify();
+    }
+
+    fn update_last_fetch(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).project().read(cx).fs().clone();
+        let path = repository
+            .read(cx)
+            .repository_dir_abs_path
+            .join("FETCH_HEAD");
+        self.last_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let modified = fs
+                .metadata(&path)
+                .await
+                .log_err()
+                .flatten()
+                .map(|metadata| metadata.mtime.timestamp_for_user());
+            this.update(cx, |this, cx| {
+                if this.last_fetch != modified {
+                    this.last_fetch = modified;
+                    cx.notify();
+                }
+            })
+            .log_err();
+        }));
     }
 
     fn load_commit(
@@ -1795,6 +1844,41 @@ impl Smartlog {
             anyhow::Ok(())
         });
         self.run_logged("Failed to show commit", task, window, cx);
+    }
+
+    /// The branch names shown beside a commit. Trunk commits aren't in the draft log, so their
+    /// names come from the branch list, and hidden-commit markers are never shown.
+    fn chip_names(&self, sha: Oid, kind: RowKind, cx: &App) -> Vec<String> {
+        if kind == RowKind::Public {
+            let Some(repository) = self.repository(cx) else {
+                return Vec::new();
+            };
+            let sha = sha.to_string();
+            let mut names: Vec<String> = repository
+                .read(cx)
+                .branch_list
+                .iter()
+                .filter(|branch| {
+                    branch
+                        .most_recent_commit
+                        .as_ref()
+                        .is_some_and(|commit| commit.sha.as_ref() == sha)
+                })
+                .map(|branch| branch.name().to_string())
+                .collect();
+            names.dedup();
+            return names;
+        }
+
+        self.ref_names
+            .get(&sha)
+            .into_iter()
+            .flatten()
+            .filter(|name| {
+                !name.starts_with("tag: ") && !name.starts_with(HIDDEN_COMMIT_REF_PREFIX)
+            })
+            .map(|name| name.strip_prefix("HEAD -> ").unwrap_or(name).to_string())
+            .collect()
     }
 
     fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
@@ -2939,18 +3023,9 @@ impl Smartlog {
                         )
                     })
                     .children(
-                        self.ref_names
-                            .get(&sha)
+                        self.chip_names(sha, row.kind, cx)
                             .into_iter()
-                            .flatten()
-                            .filter(|name| !name.as_ref().starts_with("tag: "))
-                            .map(|name| {
-                                let name = name
-                                    .strip_prefix("HEAD -> ")
-                                    .unwrap_or(name.as_ref())
-                                    .to_string();
-                                Chip::new(name).label_size(LabelSize::Small)
-                            }),
+                            .map(|name| Chip::new(name).label_size(LabelSize::Small)),
                     )
                     .when(row.is_head && self.uncommitted_files.is_empty(), |this| {
                         this.child(Self::you_are_here_pill(cx))
@@ -3104,6 +3179,21 @@ impl Render for Smartlog {
                         window.dispatch_action(Box::new(git::Fetch), cx);
                     }),
             )
+            .when_some(self.last_fetch, |this, last_fetch| {
+                let elapsed = SystemTime::now()
+                    .duration_since(last_fetch)
+                    .unwrap_or_default();
+                this.child(
+                    div()
+                        .id("smartlog-last-fetch")
+                        .child(
+                            Label::new(short_duration(elapsed))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text("Time since the last fetch")),
+                )
+            })
             .child(
                 h_flex()
                     .h_7()
@@ -3826,6 +3916,15 @@ mod tests {
         assert_eq!(step_cursor(&rows, None, None, true), Some(oid(1)));
         assert_eq!(step_cursor(&rows, None, None, false), Some(oid(3)));
         assert_eq!(step_cursor(&[], None, None, true), None);
+    }
+
+    #[test]
+    fn durations_are_shortened_like_the_pull_badge() {
+        assert_eq!(short_duration(Duration::from_secs(5)), "now");
+        assert_eq!(short_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(short_duration(Duration::from_secs(59 * 60)), "59m");
+        assert_eq!(short_duration(Duration::from_secs(2 * 3600 + 5)), "2h");
+        assert_eq!(short_duration(Duration::from_secs(3 * 86_400)), "3d");
     }
 
     #[test]
