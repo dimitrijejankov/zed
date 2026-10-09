@@ -1174,6 +1174,7 @@ impl Smartlog {
                 RepositoryEvent::GraphEvent((LogSource::Draft(_), _), _)
                 | RepositoryEvent::HeadChanged
                 | RepositoryEvent::BranchListChanged
+                | RepositoryEvent::TagsChanged
                 | RepositoryEvent::StatusesChanged => this.refresh(window, cx),
                 RepositoryEvent::StashEntriesChanged => cx.notify(),
                 _ => {}
@@ -2014,6 +2015,7 @@ impl Smartlog {
                 })
             })
             .collect();
+        let hide_blocked = is_draft && self.protected_from_hiding.contains(&sha);
         let branches_here: Vec<String> = self
             .local_branches_at(sha, cx)
             .into_iter()
@@ -2290,9 +2292,16 @@ impl Smartlog {
                     }
                 })
                 .when(
-                    can_hide || is_hidden_root || (is_head && is_draft),
+                    can_hide || is_hidden_root || (is_head && is_draft) || hide_blocked,
                     |menu| menu.separator(),
                 )
+                .when(hide_blocked, |menu| {
+                    menu.label(if is_head {
+                        "Can't hide the checked-out commit"
+                    } else {
+                        "Can't hide: the checked-out commit is built on it"
+                    })
+                })
                 .when(can_hide, |menu| {
                     menu.entry("Hide Commit and Descendants", None, {
                         let smartlog = smartlog.clone();
@@ -2490,6 +2499,22 @@ impl Smartlog {
             })
             .map(|name| name.strip_prefix("HEAD -> ").unwrap_or(name).to_string())
             .collect()
+    }
+
+    /// A branch label, with the trunk marked so it is clear which branch everything is measured
+    /// against.
+    fn branch_chip(&self, name: String, cx: &App) -> Chip {
+        let is_trunk = name == self.trunk.as_ref();
+        let chip = Chip::new(name).label_size(LabelSize::Small);
+        if is_trunk {
+            chip.icon(IconName::GitBranch)
+                .icon_color(Color::Info)
+                .label_color(Color::Info)
+                .bg_color(cx.theme().status().info_background)
+                .border_color(cx.theme().status().info_border)
+        } else {
+            chip
+        }
     }
 
     fn local_branches_at(&self, sha: Oid, cx: &App) -> Vec<String> {
@@ -4313,7 +4338,7 @@ impl Smartlog {
                     .children(
                         self.chip_names(sha, row.kind, cx)
                             .into_iter()
-                            .map(|name| Chip::new(name).label_size(LabelSize::Small)),
+                            .map(|name| self.branch_chip(name, cx)),
                     )
                     .when_some(self.worktree_checked_out_at(sha, cx), |this, worktree| {
                         this.child(
@@ -4496,6 +4521,22 @@ impl Render for Smartlog {
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(git::Fetch), cx);
                     }),
+            )
+            .child(
+                div()
+                    .id("smartlog-trunk")
+                    .child(
+                        Chip::new(format!("Trunk: {}", self.trunk))
+                            .label_size(LabelSize::Small)
+                            .icon(IconName::GitBranch)
+                            .icon_color(Color::Info)
+                            .label_color(Color::Info)
+                            .bg_color(cx.theme().status().info_background)
+                            .border_color(cx.theme().status().info_border),
+                    )
+                    .tooltip(Tooltip::text(
+                        "Everything not on this branch is shown as a draft. Right-click a commit and choose Set Trunk to change it.",
+                    )),
             )
             .when_some(self.last_fetch, |this, last_fetch| {
                 let elapsed = SystemTime::now()
@@ -6524,6 +6565,19 @@ mod tests {
             run_git(path, &["symbolic-ref", "-q", "HEAD"]),
             "refs/heads/develop",
             "going to a commit with a branch checks the branch out instead of detaching"
+        );
+
+        let feature_tip = run_git(path, &["rev-parse", "feature"]);
+        repository
+            .update(cx, |repository, _| {
+                repository.set_commit_hidden(feature_tip.clone(), true)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            wait_for_drafts(cx, 0),
+            "hiding a commit removes it from the Smartlog without a manual refresh"
         );
     }
 }

@@ -134,6 +134,7 @@ Right-click a commit, or select several, for these actions:
 - **Edit Stack** reorders, drops or combines the commits of a straight stack. The commits are merged in memory, so nothing changes if the new order conflicts.
 - **Fold** combines selected commits, **Split** divides a commit by file, hunk or line. As with `git add -p`, added lines of a hunk are placed after its removed lines, and **Amend Changes to Here** adds your uncommitted changes to an older commit.
 - **Submit Stack** pushes every branch in a stack to the default remote.
+- The trunk branch is marked with a blue chip, both on its commit and in the header as "Trunk: …".
 - **Hide** removes a commit and everything built on it from the view without deleting it. Hidden commits can be shown again from the header.
 - **Switch to** and **Merge into** appear for commits with a local branch. Switch checks the branch out, and Goto does the same for a commit that has one, so `HEAD` isn't left detached. Merge merges the branch into the checked-out one. If it stops on conflicts, the banner offers Continue and Abort.
 - **Switch Branch** and **Merge Branch Into Current** list every local branch from any commit's menu, so you can change the checked-out branch without finding its commit first. The checked-out branch is ticked.
