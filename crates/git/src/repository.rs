@@ -704,23 +704,52 @@ pub enum FetchOptions {
     All,
     Unshallow,
     Remote(Remote),
+    /// Fetch one ref, such as a branch, a tag, a commit or a pull request, from a remote.
+    Ref {
+        remote: Remote,
+        refspec: String,
+    },
 }
 
 impl FetchOptions {
     pub fn to_proto(&self) -> Option<String> {
         match self {
             FetchOptions::All | FetchOptions::Unshallow => None,
-            FetchOptions::Remote(remote) => Some(remote.clone().name.into()),
+            FetchOptions::Remote(remote) | FetchOptions::Ref { remote, .. } => {
+                Some(remote.clone().name.into())
+            }
         }
     }
 
-    pub fn from_proto(remote_name: Option<String>, unshallow: bool) -> Self {
+    /// The arguments for `git`, starting with the subcommand.
+    pub fn arguments(&self) -> Vec<String> {
+        let mut arguments = vec!["fetch".to_string(), self.to_string()];
+        arguments.extend(self.refspec_to_proto());
+        arguments
+    }
+
+    pub fn refspec_to_proto(&self) -> Option<String> {
+        match self {
+            FetchOptions::Ref { refspec, .. } => Some(refspec.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn from_proto(
+        remote_name: Option<String>,
+        unshallow: bool,
+        refspec: Option<String>,
+    ) -> Self {
         if unshallow {
             return FetchOptions::Unshallow;
         }
-        match remote_name {
-            Some(name) => FetchOptions::Remote(Remote { name: name.into() }),
-            None => FetchOptions::All,
+        match (remote_name, refspec) {
+            (Some(name), Some(refspec)) => FetchOptions::Ref {
+                remote: Remote { name: name.into() },
+                refspec,
+            },
+            (Some(name), None) => FetchOptions::Remote(Remote { name: name.into() }),
+            (None, _) => FetchOptions::All,
         }
     }
 
@@ -729,6 +758,7 @@ impl FetchOptions {
             Self::All => "Fetch all remotes".into(),
             Self::Unshallow => "Fetch missing history".into(),
             Self::Remote(remote) => remote.name.clone(),
+            Self::Ref { remote, refspec } => format!("{refspec} from {}", remote.name).into(),
         }
     }
 }
@@ -738,7 +768,9 @@ impl std::fmt::Display for FetchOptions {
         match self {
             FetchOptions::All => write!(f, "--all"),
             FetchOptions::Unshallow => write!(f, "--unshallow"),
-            FetchOptions::Remote(remote) => write!(f, "{}", remote.name),
+            FetchOptions::Remote(remote) | FetchOptions::Ref { remote, .. } => {
+                write!(f, "{}", remote.name)
+            }
         }
     }
 }
@@ -3215,7 +3247,7 @@ impl GitRepository for RealGitRepository {
     ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
         let working_directory = self.command_directory();
         let git_directory = self.path();
-        let remote_name = format!("{}", fetch_options);
+        let fetch_arguments = fetch_options.arguments();
         let git_binary_path = self.system_git_binary_path.clone();
         let executor = cx.background_executor().clone();
         let is_trusted = self.is_trusted();
@@ -3230,7 +3262,7 @@ impl GitRepository for RealGitRepository {
                 executor.clone(),
                 is_trusted,
             );
-            let mut command = git.build_command(&["fetch", &remote_name]);
+            let mut command = git.build_command(&fetch_arguments);
             command
                 .envs(env.iter())
                 .stdout(Stdio::piped())
@@ -9129,6 +9161,44 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
             head
+        );
+    }
+
+    #[test]
+    fn test_fetch_options_round_trip_through_proto_and_become_git_arguments() {
+        let remote = Remote {
+            name: "origin".into(),
+        };
+        let options = [
+            FetchOptions::All,
+            FetchOptions::Unshallow,
+            FetchOptions::Remote(remote.clone()),
+            FetchOptions::Ref {
+                remote,
+                refspec: "pull/12/head".to_string(),
+            },
+        ];
+        for options in options {
+            assert_eq!(
+                FetchOptions::from_proto(
+                    options.to_proto(),
+                    options == FetchOptions::Unshallow,
+                    options.refspec_to_proto()
+                ),
+                options
+            );
+        }
+
+        assert_eq!(FetchOptions::All.arguments(), ["fetch", "--all"]);
+        assert_eq!(
+            FetchOptions::Ref {
+                remote: Remote {
+                    name: "upstream".into()
+                },
+                refspec: "feature".to_string()
+            }
+            .arguments(),
+            ["fetch", "upstream", "feature"]
         );
     }
 }

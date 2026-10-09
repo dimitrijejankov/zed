@@ -4,8 +4,8 @@ use editor::{Editor, EditorEvent};
 use git::{
     Oid,
     repository::{
-        CommitOptions, HIDDEN_COMMIT_REF_PREFIX, InitialGraphCommitData, LogOrder, LogSource,
-        ResetMode,
+        CommitOptions, FetchOptions, HIDDEN_COMMIT_REF_PREFIX, InitialGraphCommitData, LogOrder,
+        LogSource, ResetMode,
     },
 };
 use gpui::{
@@ -50,6 +50,7 @@ use workspace::{Toast, notifications::NotificationId};
 
 mod absorb;
 mod bookmarks;
+mod download;
 mod edit_stack;
 mod persistence;
 mod sidebar;
@@ -2549,6 +2550,53 @@ impl Smartlog {
         self.run_logged("Failed to absorb changes", task, window, cx);
     }
 
+    /// Fetches `refspec` from the default remote, keeps it reachable under a new local branch and,
+    /// if asked, checks it out.
+    fn download_commits(
+        &mut self,
+        refspec: String,
+        go_to_it: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let askpass = self.askpass_delegate("git fetch", window, cx);
+        let bookmark = download::download_bookmark_name(&refspec);
+
+        let task = cx.spawn_in(window, async move |_, cx| {
+            let remote = repository
+                .update(cx, |repository, _| repository.get_remotes(None, false))
+                .await??
+                .into_iter()
+                .next()
+                .context("No remote is available to download from")?;
+            repository
+                .update(cx, |repository, cx| {
+                    repository.fetch(FetchOptions::Ref { remote, refspec }, askpass, cx)
+                })
+                .await??;
+            let fetched = repository
+                .update(cx, |repository, cx| {
+                    repository.show_commit("FETCH_HEAD".to_string(), cx)
+                })
+                .await?;
+            repository
+                .update(cx, |repository, _| {
+                    repository.create_ref(format!("refs/heads/{bookmark}"), fetched.sha.to_string())
+                })
+                .await??;
+            if go_to_it {
+                repository
+                    .update(cx, |repository, _| repository.change_branch(bookmark))
+                    .await??;
+            }
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to download commits", task, window, cx);
+    }
+
     fn apply_split(
         &mut self,
         sha: Oid,
@@ -3972,6 +4020,21 @@ impl Render for Smartlog {
                             })),
                     )
                     .child(
+                        IconButton::new("smartlog-download", IconName::Download)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Download commits"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let smartlog = cx.weak_entity();
+                                this.workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.toggle_modal(window, cx, |window, cx| {
+                                            download::DownloadModal::new(smartlog, window, cx)
+                                        });
+                                    })
+                                    .log_err();
+                            })),
+                    )
+                    .child(
                         IconButton::new("smartlog-bookmarks", IconName::Bookmark)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Manage bookmarks"))
@@ -5326,6 +5389,14 @@ mod tests {
         draw(cx);
 
         smartlog.update_in(cx, |smartlog, window, cx| smartlog.open_absorb(window, cx));
+        draw(cx);
+
+        let download_smartlog = smartlog.downgrade();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                download::DownloadModal::new(download_smartlog, window, cx)
+            });
+        });
         draw(cx);
 
         let split_smartlog = smartlog.downgrade();

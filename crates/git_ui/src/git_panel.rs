@@ -4537,7 +4537,9 @@ impl GitPanel {
                 this.update(cx, |this, cx| {
                     let action = match fetch_options {
                         FetchOptions::All | FetchOptions::Unshallow => RemoteAction::Fetch(None),
-                        FetchOptions::Remote(remote) => RemoteAction::Fetch(Some(remote)),
+                        FetchOptions::Remote(remote) | FetchOptions::Ref { remote, .. } => {
+                            RemoteAction::Fetch(Some(remote))
+                        }
                     };
                     match remote_message {
                         Ok(remote_message) => this.show_remote_output(action, remote_message, cx),
