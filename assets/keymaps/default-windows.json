@@ -1665,6 +1665,23 @@
     },
   },
   {
+    "context": "Smartlog",
+    "bindings": {
+      "up": "smartlog::SelectPreviousCommit",
+      "down": "smartlog::SelectNextCommit",
+      "shift-up": "smartlog::ExtendSelectionUp",
+      "shift-down": "smartlog::ExtendSelectionDown",
+      "right": "smartlog::OpenDetails",
+      "escape": "smartlog::ClearSelection",
+      "alt-a": "smartlog::SelectAllCommits",
+      "backspace": "smartlog::HideSelectedCommits",
+      "ctrl-.": "smartlog::ToggleSidebar",
+      "ctrl-f": "smartlog::FocusFilter",
+      "alt-p": "smartlog::Pull",
+      "alt-r": "smartlog::RebaseOntoTrunk",
+    },
+  },
+  {
     "context": "GitGraphSearchBar > Editor",
     "bindings": {
       "tab": "git_graph::FocusNextTabStop",

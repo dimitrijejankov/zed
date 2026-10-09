@@ -11,8 +11,8 @@ use git::{
 use gpui::{
     Anchor, AnyElement, App, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, Pixels, Point,
-    PromptLevel, SharedString, Subscription, Task, WeakEntity, Window, actions, anchored, deferred,
-    div, prelude::*, px,
+    PromptLevel, ScrollHandle, SharedString, Subscription, Task, WeakEntity, Window, actions,
+    anchored, deferred, div, prelude::*, px,
 };
 use menu::{Cancel, Confirm};
 use project::git_store::{
@@ -63,6 +63,30 @@ actions!(
     [
         /// Opens the Smartlog, showing only draft commits that are not on the trunk branch.
         Open,
+        /// Selects the commit above the current one.
+        SelectPreviousCommit,
+        /// Selects the commit below the current one.
+        SelectNextCommit,
+        /// Extends the selection to the commit above.
+        ExtendSelectionUp,
+        /// Extends the selection to the commit below.
+        ExtendSelectionDown,
+        /// Shows the Commit Info sidebar for the selection.
+        OpenDetails,
+        /// Clears the selection.
+        ClearSelection,
+        /// Selects every draft commit.
+        SelectAllCommits,
+        /// Hides the selected commits and everything built on them.
+        HideSelectedCommits,
+        /// Shows or hides the Commit Info sidebar.
+        ToggleSidebar,
+        /// Moves focus to the commit filter.
+        FocusFilter,
+        /// Fetches new commits from the remote.
+        Pull,
+        /// Rebases the stack containing the checked-out commit onto the trunk.
+        RebaseOntoTrunk,
     ]
 );
 
@@ -468,6 +492,26 @@ fn plan_rebase(
 struct SelectableRow {
     sha: Oid,
     is_public: bool,
+}
+
+/// The commit a cursor moves to when stepping down (`forward`) or up the list. Without a cursor it
+/// starts at the checked-out commit, or at the first or last commit.
+fn step_cursor(
+    rows: &[SelectableRow],
+    cursor: Option<Oid>,
+    head: Option<Oid>,
+    forward: bool,
+) -> Option<Oid> {
+    let current = cursor
+        .or(head)
+        .and_then(|sha| rows.iter().position(|row| row.sha == sha));
+    let next = match (current, forward) {
+        (Some(current), true) => (current + 1).min(rows.len().checked_sub(1)?),
+        (Some(current), false) => current.saturating_sub(1),
+        (None, true) => 0,
+        (None, false) => rows.len().checked_sub(1)?,
+    };
+    rows.get(next).map(|row| row.sha)
 }
 
 /// Applies a click to the commit selection the way ISL does: a plain click selects one commit
@@ -887,6 +931,8 @@ pub struct Smartlog {
     ref_names: HashMap<Oid, Vec<SharedString>>,
     selection: HashSet<Oid>,
     selection_anchor: Option<Oid>,
+    selection_cursor: Option<Oid>,
+    list_scroll_handle: ScrollHandle,
     head: Option<Oid>,
     parents: HashMap<Oid, Option<Oid>>,
     hidden: HashSet<Oid>,
@@ -976,6 +1022,8 @@ impl Smartlog {
             ref_names: HashMap::default(),
             selection: HashSet::default(),
             selection_anchor: None,
+            selection_cursor: None,
+            list_scroll_handle: ScrollHandle::new(),
             head: None,
             parents: HashMap::default(),
             hidden: HashSet::default(),
@@ -1177,7 +1225,148 @@ impl Smartlog {
         );
         self.selection = selection;
         self.selection_anchor = anchor;
+        self.selection_cursor = Some(sha);
+        window.focus(&self.focus_handle, cx);
         self.sync_sidebar(window, cx);
+    }
+
+    fn move_cursor(
+        &mut self,
+        forward: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.selectable_rows();
+        let Some(target) = step_cursor(&rows, self.selection_cursor, self.head, forward) else {
+            return;
+        };
+        if extend {
+            let anchor = self
+                .selection_anchor
+                .or(self.selection_cursor)
+                .unwrap_or(target);
+            let (selection, anchor) =
+                apply_click(&rows, &self.selection, Some(anchor), target, true, false);
+            self.selection = selection;
+            self.selection_anchor = anchor;
+        } else {
+            self.selection = HashSet::from_iter([target]);
+            self.selection_anchor = Some(target);
+        }
+        self.selection_cursor = Some(target);
+        if let Some(row) = self
+            .layout
+            .rows
+            .iter()
+            .position(|row| row.sha == Some(target))
+        {
+            self.list_scroll_handle.scroll_to_item(row);
+        }
+        self.sync_sidebar(window, cx);
+    }
+
+    fn select_previous_commit(
+        &mut self,
+        _: &SelectPreviousCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_cursor(false, false, window, cx);
+    }
+
+    fn select_next_commit(
+        &mut self,
+        _: &SelectNextCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_cursor(true, false, window, cx);
+    }
+
+    fn extend_selection_up(
+        &mut self,
+        _: &ExtendSelectionUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_cursor(false, true, window, cx);
+    }
+
+    fn extend_selection_down(
+        &mut self,
+        _: &ExtendSelectionDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_cursor(true, true, window, cx);
+    }
+
+    fn open_details(&mut self, _: &OpenDetails, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.collapsed = false;
+        cx.notify();
+    }
+
+    fn clear_selection(&mut self, _: &ClearSelection, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection.clear();
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+        self.sync_sidebar(window, cx);
+    }
+
+    fn select_all_commits(
+        &mut self,
+        _: &SelectAllCommits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = self
+            .selectable_rows()
+            .into_iter()
+            .filter(|row| !row.is_public)
+            .map(|row| row.sha)
+            .collect();
+        self.sync_sidebar(window, cx);
+    }
+
+    fn hide_selected_commits(
+        &mut self,
+        _: &HideSelectedCommits,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hideable: Vec<Oid> = self
+            .selected_in_display_order()
+            .into_iter()
+            .filter(|sha| {
+                !self.protected_from_hiding.contains(sha) && !self.hidden_closure.contains(sha)
+            })
+            .collect();
+        self.hide_commits(hideable, window, cx);
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar.collapsed = !self.sidebar.collapsed;
+        cx.notify();
+    }
+
+    fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.filter_editor.focus_handle(cx), cx);
+    }
+
+    fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(git::Fetch), cx);
+    }
+
+    fn rebase_onto_trunk(
+        &mut self,
+        _: &RebaseOntoTrunk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(plan) = self.head_rebase_plan(cx) {
+            self.rebase_stack(plan, window, cx);
+        }
     }
 
     fn shelve_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1550,12 +1739,23 @@ impl Smartlog {
     }
 
     fn hide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_commits(vec![sha], window, cx);
+    }
+
+    fn hide_commits(&mut self, shas: Vec<Oid>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.repository(cx) else {
             return;
         };
+        if shas.is_empty() {
+            return;
+        }
         let prompt = window.prompt(
             PromptLevel::Warning,
-            "Hide this commit and everything built on it?",
+            if shas.len() == 1 {
+                "Hide this commit and everything built on it?"
+            } else {
+                "Hide these commits and everything built on them?"
+            },
             Some("The commits stay in git and can be shown again with Show hidden."),
             &["Hide", "Cancel"],
             cx,
@@ -1564,14 +1764,16 @@ impl Smartlog {
             if prompt.await? != 0 {
                 return anyhow::Ok(());
             }
-            repository
-                .update(cx, |repository, _| {
-                    repository.set_commit_hidden(sha.to_string(), true)
-                })
-                .await??;
+            for sha in shas {
+                repository
+                    .update(cx, |repository, _| {
+                        repository.set_commit_hidden(sha.to_string(), true)
+                    })
+                    .await??;
+            }
             Ok(())
         });
-        self.run_logged("Failed to hide commit", task, window, cx);
+        self.run_logged("Failed to hide commits", task, window, cx);
     }
 
     fn unhide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
@@ -2976,6 +3178,7 @@ impl Render for Smartlog {
 
         let list = v_flex()
             .id("smartlog-rows")
+            .track_scroll(&self.list_scroll_handle)
             .h_full()
             .min_w_0()
             .overflow_y_scroll()
@@ -3048,6 +3251,18 @@ impl Render for Smartlog {
             .id("smartlog")
             .key_context("Smartlog")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_previous_commit))
+            .on_action(cx.listener(Self::select_next_commit))
+            .on_action(cx.listener(Self::extend_selection_up))
+            .on_action(cx.listener(Self::extend_selection_down))
+            .on_action(cx.listener(Self::open_details))
+            .on_action(cx.listener(Self::clear_selection))
+            .on_action(cx.listener(Self::select_all_commits))
+            .on_action(cx.listener(Self::hide_selected_commits))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::focus_filter))
+            .on_action(cx.listener(Self::pull))
+            .on_action(cx.listener(Self::rebase_onto_trunk))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(header)
@@ -3424,6 +3639,26 @@ mod tests {
         assert_eq!(operation_name("Failed to go to commit"), "Go to commit");
         assert_eq!(operation_name("Uncommit"), "Uncommit");
         assert_eq!(operation_name(""), "");
+    }
+
+    #[test]
+    fn the_cursor_steps_through_the_list_and_stops_at_the_ends() {
+        let rows = selectable(&[(1, false), (2, false), (3, true)]);
+
+        assert_eq!(step_cursor(&rows, Some(oid(1)), None, true), Some(oid(2)));
+        assert_eq!(step_cursor(&rows, Some(oid(2)), None, false), Some(oid(1)));
+        assert_eq!(step_cursor(&rows, Some(oid(3)), None, true), Some(oid(3)));
+        assert_eq!(step_cursor(&rows, Some(oid(1)), None, false), Some(oid(1)));
+    }
+
+    #[test]
+    fn without_a_cursor_stepping_starts_at_head_or_an_end() {
+        let rows = selectable(&[(1, false), (2, false), (3, true)]);
+
+        assert_eq!(step_cursor(&rows, None, Some(oid(2)), true), Some(oid(3)));
+        assert_eq!(step_cursor(&rows, None, None, true), Some(oid(1)));
+        assert_eq!(step_cursor(&rows, None, None, false), Some(oid(3)));
+        assert_eq!(step_cursor(&[], None, None, true), None);
     }
 
     #[test]
