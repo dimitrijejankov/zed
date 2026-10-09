@@ -1,11 +1,52 @@
 use super::*;
 use project::git_store::CommitDiff;
 
+pub(super) struct SplitLine {
+    pub(super) text: String,
+    pub(super) in_first: bool,
+}
+
 pub(super) struct SplitHunk {
     pub(super) index: u32,
     pub(super) header: String,
-    pub(super) body: String,
-    pub(super) in_first: bool,
+    pub(super) lines: Vec<SplitLine>,
+    /// A change at the end of a file without a final newline can't be cut line by line.
+    pub(super) whole_only: bool,
+}
+
+impl SplitHunk {
+    fn from_commit_hunk(hunk: &git::repository::CommitHunk) -> Self {
+        let whole_only = hunk.body.lines().any(|line| line.starts_with('\\'));
+        Self {
+            index: hunk.index,
+            header: hunk.header.clone(),
+            lines: hunk
+                .body
+                .lines()
+                .filter(|line| line.starts_with('+') || line.starts_with('-'))
+                .map(|line| SplitLine {
+                    text: line.to_string(),
+                    in_first: false,
+                })
+                .collect(),
+            whole_only,
+        }
+    }
+
+    fn toggle_state(&self) -> ToggleState {
+        let first = self.lines.iter().filter(|line| line.in_first).count();
+        match first {
+            0 => ToggleState::Unselected,
+            count if count == self.lines.len() => ToggleState::Selected,
+            _ => ToggleState::Indeterminate,
+        }
+    }
+
+    fn set_all(&mut self, in_first: bool) {
+        for line in &mut self.lines {
+            line.in_first = in_first;
+        }
+    }
 }
 
 pub(super) struct SplitFile {
@@ -22,10 +63,12 @@ impl SplitFile {
         if self.hunks.is_empty() {
             (usize::from(self.in_first), 1)
         } else {
-            (
-                self.hunks.iter().filter(|hunk| hunk.in_first).count(),
-                self.hunks.len(),
-            )
+            self.hunks.iter().fold((0, 0), |(first, total), hunk| {
+                (
+                    first + hunk.lines.iter().filter(|line| line.in_first).count(),
+                    total + hunk.lines.len(),
+                )
+            })
         }
     }
 
@@ -40,7 +83,7 @@ impl SplitFile {
     fn set_all(&mut self, in_first: bool) {
         self.in_first = in_first;
         for hunk in &mut self.hunks {
-            hunk.in_first = in_first;
+            hunk.set_all(in_first);
         }
     }
 }
@@ -64,15 +107,32 @@ pub(super) fn first_commit_selection(
         match file.units() {
             (0, _) => {}
             (first, total) if first == total => paths.push(file.path.clone()),
-            _ => selections.push(git::repository::HunkSelection {
-                path: file.path.clone(),
-                hunks: file
-                    .hunks
-                    .iter()
-                    .filter(|hunk| hunk.in_first)
-                    .map(|hunk| hunk.index)
-                    .collect(),
-            }),
+            _ => {
+                let mut selection = git::repository::HunkSelection {
+                    path: file.path.clone(),
+                    hunks: Vec::new(),
+                    lines: Vec::new(),
+                };
+                for hunk in &file.hunks {
+                    match hunk.toggle_state() {
+                        ToggleState::Unselected => {}
+                        ToggleState::Selected => selection.hunks.push(hunk.index),
+                        ToggleState::Indeterminate => {
+                            selection.lines.push(git::repository::LineSelection {
+                                hunk: hunk.index,
+                                lines: hunk
+                                    .lines
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, line)| line.in_first)
+                                    .map(|(position, _)| position as u32)
+                                    .collect(),
+                            });
+                        }
+                    }
+                }
+                selections.push(selection);
+            }
         }
     }
     (paths, selections)
@@ -218,12 +278,7 @@ fn files_of(
             hunks: hunks
                 .iter()
                 .filter(|hunk| hunk.path == file.path)
-                .map(|hunk| SplitHunk {
-                    index: hunk.index,
-                    header: hunk.header.clone(),
-                    body: hunk.body.clone(),
-                    in_first: false,
-                })
+                .map(SplitHunk::from_commit_hunk)
                 .collect(),
             expanded: false,
         })
@@ -323,56 +378,83 @@ impl Render for SplitModal {
                 continue;
             }
             for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+                let hunk_id = (index << 40) | (hunk_index << 20);
                 file_rows.push(
-                    v_flex()
+                    h_flex()
                         .pl_12()
                         .pr_3()
-                        .py_1()
-                        .gap_1()
+                        .h_7()
+                        .gap_2()
                         .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Checkbox::new(
-                                        ("smartlog-split-hunk", index * 10_000 + hunk_index),
-                                        if hunk.in_first {
-                                            ToggleState::Selected
-                                        } else {
-                                            ToggleState::Unselected
-                                        },
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, state: &ToggleState, _, cx| {
-                                            if let Some(hunk) = this
-                                                .files
-                                                .as_mut()
-                                                .and_then(|files| files.get_mut(index))
-                                                .and_then(|file| file.hunks.get_mut(hunk_index))
-                                            {
-                                                hunk.in_first = *state == ToggleState::Selected;
-                                            }
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    Label::new(hunk.header.clone())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                ),
+                            Checkbox::new(("smartlog-split-hunk", hunk_id), hunk.toggle_state())
+                                .on_click(cx.listener(move |this, state: &ToggleState, _, cx| {
+                                    if let Some(hunk) = this
+                                        .files
+                                        .as_mut()
+                                        .and_then(|files| files.get_mut(index))
+                                        .and_then(|file| file.hunks.get_mut(hunk_index))
+                                    {
+                                        hunk.set_all(*state == ToggleState::Selected);
+                                    }
+                                    cx.notify();
+                                })),
                         )
                         .child(
-                            div().pl_6().child(
-                                Label::new(
-                                    hunk.body.lines().take(6).collect::<Vec<_>>().join("\n"),
-                                )
-                                .size(LabelSize::XSmall)
-                                .buffer_font(cx),
-                            ),
+                            Label::new(hunk.header.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
                         )
                         .into_any_element(),
                 );
+                if hunk.whole_only {
+                    continue;
+                }
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    let color = if line.text.starts_with('+') {
+                        Color::Created
+                    } else {
+                        Color::Deleted
+                    };
+                    file_rows.push(
+                        h_flex()
+                            .pl_20()
+                            .pr_3()
+                            .gap_2()
+                            .child(
+                                Checkbox::new(
+                                    ("smartlog-split-line", hunk_id | (line_index + 1)),
+                                    if line.in_first {
+                                        ToggleState::Selected
+                                    } else {
+                                        ToggleState::Unselected
+                                    },
+                                )
+                                .on_click(cx.listener(
+                                    move |this, state: &ToggleState, _, cx| {
+                                        if let Some(line) = this
+                                            .files
+                                            .as_mut()
+                                            .and_then(|files| files.get_mut(index))
+                                            .and_then(|file| file.hunks.get_mut(hunk_index))
+                                            .and_then(|hunk| hunk.lines.get_mut(line_index))
+                                        {
+                                            line.in_first = *state == ToggleState::Selected;
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Label::new(line.text.clone())
+                                    .size(LabelSize::Small)
+                                    .color(color)
+                                    .buffer_font(cx)
+                                    .truncate(),
+                            )
+                            .into_any_element(),
+                    );
+                }
             }
         }
 
@@ -402,9 +484,11 @@ impl Render for SplitModal {
                     .pb_2()
                     .gap_1()
                     .child(
-                        Label::new("Tick the files, or expand one to tick single hunks, for the first commit.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        Label::new(
+                            "Tick the files, hunks or lines that belong in the first commit.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     )
                     .child(field(&self.first_title))
                     .child(field(&self.second_title)),
@@ -477,8 +561,11 @@ mod tests {
                 .map(|(index, in_first)| SplitHunk {
                     index: index as u32,
                     header: String::new(),
-                    body: String::new(),
-                    in_first: *in_first,
+                    lines: vec![SplitLine {
+                        text: "+x".into(),
+                        in_first: *in_first,
+                    }],
+                    whole_only: false,
                 })
                 .collect(),
             ..file(name, false)
@@ -513,6 +600,27 @@ mod tests {
         let (paths, selections) = first_commit_selection(&mixed);
         assert_eq!(paths.len(), 1);
         assert!(selections.is_empty());
+    }
+
+    #[test]
+    fn part_of_a_hunk_is_selected_by_line_number() {
+        let mut file = hunked_file("a", &[false]);
+        file.hunks[0].lines = ["-one", "-two", "+uno", "+dos"]
+            .into_iter()
+            .map(|text| SplitLine {
+                text: text.into(),
+                in_first: false,
+            })
+            .collect();
+        file.hunks[0].lines[1].in_first = true;
+        file.hunks[0].lines[2].in_first = true;
+        let files = [file];
+        assert!(can_split(&files));
+        let (paths, selections) = first_commit_selection(&files);
+        assert!(paths.is_empty());
+        assert!(selections[0].hunks.is_empty());
+        assert_eq!(selections[0].lines[0].hunk, 0);
+        assert_eq!(selections[0].lines[0].lines, vec![1, 2]);
     }
 
     #[test]

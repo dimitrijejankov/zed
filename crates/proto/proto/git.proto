@@ -742,6 +742,12 @@ message GitSplitCommit {
 message GitHunkSelection {
   string path = 1;
   repeated uint32 hunks = 2;
+  repeated GitLineSelection lines = 3;
+}
+
+message GitLineSelection {
+  uint32 hunk = 1;
+  repeated uint32 lines = 2;
 }
 
 message GitCommitHunks {

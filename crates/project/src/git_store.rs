@@ -4377,6 +4377,14 @@ impl GitStore {
                 Ok(git::repository::HunkSelection {
                     path: RepoPath::from_proto(&selection.path)?,
                     hunks: selection.hunks.clone(),
+                    lines: selection
+                        .lines
+                        .iter()
+                        .map(|part| git::repository::LineSelection {
+                            hunk: part.hunk,
+                            lines: part.lines.clone(),
+                        })
+                        .collect(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -10100,6 +10108,14 @@ impl Repository {
                                     .map(|selection| proto::GitHunkSelection {
                                         path: selection.path.as_unix_str().to_owned(),
                                         hunks: selection.hunks,
+                                        lines: selection
+                                            .lines
+                                            .into_iter()
+                                            .map(|part| proto::GitLineSelection {
+                                                hunk: part.hunk,
+                                                lines: part.lines,
+                                            })
+                                            .collect(),
                                     })
                                     .collect(),
                             })
