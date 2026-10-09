@@ -44,6 +44,7 @@ use git::repository::RepoPath;
 use git_ui_core::askpass_modal::AskPassModal;
 use workspace::{Toast, notifications::NotificationId};
 
+mod persistence;
 mod sidebar;
 
 use sidebar::SidebarState;
@@ -91,6 +92,8 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    workspace::register_serializable_item::<Smartlog>(cx);
+
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &Open, window, cx| {
             open(workspace, window, cx);
@@ -1124,6 +1127,7 @@ impl Smartlog {
         {
             self.selection = HashSet::from_iter([pending]);
             self.selection_anchor = Some(pending);
+            self.selection_cursor = Some(pending);
             self.pending_selection = None;
         }
 
@@ -1304,6 +1308,7 @@ impl Smartlog {
 
     fn open_details(&mut self, _: &OpenDetails, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar.collapsed = false;
+        cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
@@ -1347,6 +1352,7 @@ impl Smartlog {
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.sidebar.collapsed = !self.sidebar.collapsed;
+        cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
@@ -3237,6 +3243,7 @@ impl Render for Smartlog {
                 this.sidebar.split.update(cx, |state, _| {
                     state.commit_ratio();
                 });
+                cx.emit(ItemEvent::Edit);
             }))
             .child(list)
             .when(sidebar_open, |this| {
@@ -3280,6 +3287,166 @@ impl Render for Smartlog {
                 )
                 .with_priority(1)
             }))
+    }
+}
+
+impl workspace::SerializableItem for Smartlog {
+    fn serialized_item_kind() -> &'static str {
+        "Smartlog"
+    }
+
+    fn cleanup(
+        workspace_id: workspace::WorkspaceId,
+        alive_items: Vec<workspace::ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        workspace::delete_unloaded_items(
+            alive_items,
+            workspace_id,
+            "smartlogs",
+            &persistence::SmartlogsDb::global(cx),
+            cx,
+        )
+    }
+
+    fn deserialize(
+        project: Entity<project::Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: workspace::WorkspaceId,
+        item_id: workspace::ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let database = persistence::SmartlogsDb::global(cx);
+        let state = match database.get_smartlog(item_id, workspace_id) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Task::ready(Err(anyhow::anyhow!("No Smartlog to deserialize"))),
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let Some(trunk) = state.trunk.clone() else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "The saved Smartlog has no trunk branch"
+            )));
+        };
+
+        let window_handle = window.window_handle();
+        let project = project.read(cx);
+        let git_store = project.git_store().clone();
+        let wait = project.wait_for_initial_scan(cx);
+
+        cx.spawn(async move |cx| {
+            wait.await;
+
+            cx.update_window(window_handle, |_, window, cx| {
+                let repository_id = git_store.read(cx).repositories().iter().find_map(
+                    |(&repository_id, repository)| {
+                        (repository
+                            .read(cx)
+                            .snapshot()
+                            .work_directory_abs_path
+                            .as_ref()
+                            == state.repo_working_path.as_path())
+                        .then_some(repository_id)
+                    },
+                );
+                let Some(repository_id) = repository_id else {
+                    anyhow::bail!(
+                        "Repository not found for path: {:?}",
+                        state.repo_working_path
+                    );
+                };
+
+                let smartlog = cx.new(|cx| {
+                    Smartlog::new(
+                        repository_id,
+                        git_store,
+                        workspace,
+                        trunk.into(),
+                        window,
+                        cx,
+                    )
+                });
+                smartlog.update(cx, |smartlog, cx| {
+                    smartlog.restore(&state, window, cx);
+                });
+                Ok(smartlog)
+            })?
+        })
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: workspace::ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        let workspace_id = workspace.database_id()?;
+        let repository = self.repository(cx)?;
+        let repo_working_path = repository
+            .read(cx)
+            .snapshot()
+            .work_directory_abs_path
+            .to_string_lossy()
+            .to_string();
+        let trunk = self.trunk.to_string();
+        let selected_sha = self
+            .selection_cursor
+            .filter(|sha| self.selection.contains(sha))
+            .map(|sha| sha.to_string());
+        let sidebar_collapsed = self.sidebar.collapsed;
+        let sidebar_list_permille =
+            persistence::ratio_to_permille(self.sidebar.split.read(cx).visible_left_ratio());
+        let show_hidden = self.show_hidden;
+        let filter = Some(self.filter_editor.read(cx).text(cx)).filter(|text| !text.is_empty());
+
+        let database = persistence::SmartlogsDb::global(cx);
+        Some(cx.background_spawn(async move {
+            database
+                .save_smartlog(
+                    item_id,
+                    workspace_id,
+                    repo_working_path,
+                    trunk,
+                    selected_sha,
+                    sidebar_collapsed,
+                    sidebar_list_permille,
+                    show_hidden,
+                    filter,
+                )
+                .await
+        }))
+    }
+
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(event, ItemEvent::UpdateTab | ItemEvent::Edit)
+    }
+}
+
+impl Smartlog {
+    fn restore(
+        &mut self,
+        state: &persistence::SerializedSmartlog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar.collapsed = state.sidebar_collapsed.unwrap_or(false);
+        if let Some(permille) = state.sidebar_list_permille {
+            let ratio = persistence::permille_to_ratio(permille);
+            self.sidebar.split = cx.new(|_| SplitState::with_left_ratio(ratio));
+        }
+        self.show_hidden = state.show_hidden.unwrap_or(false);
+        if let Some(filter) = &state.filter {
+            self.filter_editor.update(cx, |editor, cx| {
+                editor.set_text(filter.as_str(), window, cx)
+            });
+        }
+        self.pending_selection = state
+            .selected_sha
+            .as_deref()
+            .and_then(|sha| sha.parse::<Oid>().ok());
+        self.refresh(window, cx);
     }
 }
 
