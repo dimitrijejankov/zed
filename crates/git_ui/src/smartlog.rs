@@ -544,6 +544,32 @@ fn plan_drag_rebase(
     (!moved.contains(&target) && target != plan.old_base).then_some(plan)
 }
 
+/// Why dropping `source` onto `target` can't be turned into a rebase, for when
+/// `plan_drag_rebase` finds none.
+fn drag_rebase_refusal(
+    parents: &HashMap<Oid, Option<Oid>>,
+    source: Oid,
+    target: Oid,
+) -> &'static str {
+    let Some(old_base) = parents.get(&source).copied().flatten() else {
+        return "Only draft commits can be moved.";
+    };
+    if stack_members(parents, source).contains(&target) {
+        return "A commit can't be moved onto itself or onto something built on it.";
+    }
+    if target == old_base {
+        return "That commit is already based on the one it was dropped on.";
+    }
+    let tips = stack_members(parents, source)
+        .into_iter()
+        .filter(|member| !parents.values().any(|parent| *parent == Some(*member)))
+        .count();
+    if tips > 1 {
+        return "Several branches are built on this commit. Move them one at a time.";
+    }
+    "This commit can't be rebased there."
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SelectableRow {
     sha: Oid,
@@ -2768,6 +2794,13 @@ impl Smartlog {
             return;
         }
         let Some(plan) = self.drag_rebase_plan(source, target, cx) else {
+            let reason = drag_rebase_refusal(&self.parents, source, target);
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .show_toast(Toast::new(NotificationId::unique::<Smartlog>(), reason), cx);
+                })
+                .log_err();
             return;
         };
         let count = stack_members(&self.parents, source).len();
@@ -4969,6 +5002,17 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_drop_says_why() {
+        let (trunk, a, b, c, d) = (oid(1), oid(2), oid(3), oid(4), oid(5));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (c, Some(b)), (d, Some(b))]);
+
+        assert!(drag_rebase_refusal(&parents, trunk, a).contains("draft"));
+        assert!(drag_rebase_refusal(&parents, b, c).contains("itself"));
+        assert!(drag_rebase_refusal(&parents, c, b).contains("already based"));
+        assert!(drag_rebase_refusal(&parents, b, trunk).contains("Several branches"));
+    }
+
+    #[test]
     fn conflict_output_is_recognised() {
         assert!(stopped_on_conflicts(&anyhow::anyhow!(
             "CONFLICT (content): Merge conflict in a.txt\nerror: could not apply abc"
@@ -5863,5 +5907,127 @@ mod tests {
             assert!(smartlog.head.is_none());
             assert!(smartlog.layout.rows.is_empty());
         });
+    }
+
+    #[gpui::test]
+    async fn a_stack_held_up_by_a_kept_ref_can_be_dragged_onto_a_commit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fs::RealFs;
+        use project::Project;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        run_git(path, &["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("f.txt"), "base\n").unwrap();
+        run_git(path, &["add", "f.txt"]);
+        run_git(path, &["commit", "-qm", "base"]);
+
+        run_git(path, &["switch", "-qc", "feature"]);
+        std::fs::write(path.join("a.txt"), "a\n").unwrap();
+        run_git(path, &["add", "a.txt"]);
+        run_git(path, &["commit", "-qm", "feature one"]);
+        let parent = run_git(path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("b.txt"), "b\n").unwrap();
+        run_git(path, &["add", "b.txt"]);
+        run_git(path, &["commit", "-qm", "feature two"]);
+
+        run_git(path, &["switch", "-qc", "temporary", &parent]);
+        std::fs::write(path.join("t.txt"), "t\n").unwrap();
+        run_git(path, &["add", "t.txt"]);
+        run_git(path, &["commit", "-qm", "temporary"]);
+        let temporary = run_git(path, &["rev-parse", "HEAD"]);
+        run_git(
+            path,
+            &[
+                "update-ref",
+                &format!("refs/smartlog/kept/{temporary}"),
+                &temporary,
+            ],
+        );
+        run_git(path, &["switch", "-q", "feature"]);
+        run_git(path, &["branch", "-D", "temporary"]);
+
+        let project = Project::test(RealFs::new(None, cx.executor()), [path], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+
+        #[allow(clippy::disallowed_methods)]
+        let shown = {
+            let mut shown = false;
+            for _ in 0..200 {
+                cx.run_until_parked();
+                shown = smartlog.read_with(&*cx, |smartlog, _| smartlog.commits.len() >= 3);
+                if shown {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            shown
+        };
+        assert!(shown, "the stack held up by a kept ref should be shown");
+
+        let (source, target) = smartlog.read_with(&*cx, |smartlog, _| {
+            let find = |subject: &str| {
+                smartlog
+                    .commits
+                    .iter()
+                    .find(|(_, commit)| commit.subject.as_ref() == subject)
+                    .map(|(sha, _)| *sha)
+                    .expect("commit is shown")
+            };
+            (find("temporary"), find("feature two"))
+        });
+        let plan = smartlog.read_with(&*cx, |smartlog, cx| {
+            smartlog.drag_rebase_plan(source, target, cx)
+        });
+        assert!(
+            plan.is_some(),
+            "dragging the stack onto a commit gives a plan"
+        );
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.rebase_stack_onto(plan.unwrap(), target.to_string(), window, cx);
+        });
+        #[allow(clippy::disallowed_methods)]
+        for _ in 0..100 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let moved = run_git(
+            path,
+            &[
+                "log",
+                "--format=%s",
+                &format!("feature..smartlog/{}", &temporary[..7]),
+            ],
+        );
+        assert_eq!(moved, "temporary");
     }
 }
