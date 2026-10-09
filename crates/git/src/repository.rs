@@ -57,6 +57,10 @@ static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 /// %H - Full commit hash
 static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 
+/// Refs under this prefix mark a commit as hidden in the Smartlog. They keep the commit
+/// reachable without it being a branch, and git decorates the commit with them in the draft log.
+pub const HIDDEN_COMMIT_REF_PREFIX: &str = "refs/smartlog/hidden/";
+
 /// Number of commits to load per chunk for the git graph.
 pub const GRAPH_CHUNK_SIZE: usize = 1000;
 
@@ -752,6 +756,10 @@ impl LogSource {
             LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
             LogSource::Draft(trunk) => vec![
                 Cow::Borrowed("--ignore-missing"),
+                Cow::Borrowed("--decorate-refs=refs/heads/*"),
+                Cow::Borrowed("--decorate-refs=refs/remotes/*"),
+                Cow::Borrowed("--decorate-refs=refs/tags/*"),
+                Cow::Owned(format!("--decorate-refs={HIDDEN_COMMIT_REF_PREFIX}*")),
                 Cow::Borrowed("--branches"),
                 Cow::Borrowed("HEAD"),
                 Cow::Borrowed("--not"),
@@ -7829,6 +7837,61 @@ mod tests {
                 .fold_commits(vec![only], "folded".to_string())
                 .await
                 .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_draft_log_reports_hidden_commit_refs_and_keeps_branch_decorations(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "feature"]);
+        let first = commit_file(repo_dir.path(), "b.txt", "b", "first");
+        commit_file(repo_dir.path(), "c.txt", "c", "second");
+        git_command(
+            repo_dir.path(),
+            [
+                "update-ref".to_string(),
+                format!("{HIDDEN_COMMIT_REF_PREFIX}{first}"),
+                first.clone(),
+            ],
+        );
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let (sender, receiver) = smol::channel::unbounded();
+        repository
+            .initial_graph_data(LogSource::Draft("main".into()), LogOrder::DateOrder, sender)
+            .await
+            .unwrap();
+
+        let mut commits = Vec::new();
+        while let Ok(chunk) = receiver.try_recv() {
+            commits.extend(chunk);
+        }
+        assert_eq!(commits.len(), 2);
+        let first_commit = commits
+            .iter()
+            .find(|commit| commit.sha.to_string() == first)
+            .unwrap();
+        assert!(
+            first_commit
+                .ref_names
+                .iter()
+                .any(|name| name.as_ref() == format!("{HIDDEN_COMMIT_REF_PREFIX}{first}"))
+        );
+        let tip = commits
+            .iter()
+            .find(|commit| commit.sha.to_string() != first)
+            .unwrap();
+        assert!(
+            tip.ref_names
+                .iter()
+                .any(|name| name.as_ref().ends_with("feature"))
         );
     }
 }

@@ -3,7 +3,10 @@ use collections::{HashMap, HashSet};
 use editor::Editor;
 use git::{
     Oid,
-    repository::{CommitOptions, InitialGraphCommitData, LogOrder, LogSource, ResetMode},
+    repository::{
+        CommitOptions, HIDDEN_COMMIT_REF_PREFIX, InitialGraphCommitData, LogOrder, LogSource,
+        ResetMode,
+    },
 };
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, DefiniteLength, Entity, EventEmitter, FocusHandle,
@@ -516,6 +519,41 @@ fn apply_click(
     (only_clicked, Some(clicked))
 }
 
+/// `head` together with every commit below it that is one of the listed drafts.
+fn lineage_of(parents: &HashMap<Oid, Option<Oid>>, head: Option<Oid>) -> HashSet<Oid> {
+    let mut lineage = HashSet::default();
+    let mut current = head;
+    while let Some(sha) = current {
+        if !lineage.insert(sha) {
+            break;
+        }
+        current = parents.get(&sha).copied().flatten();
+    }
+    lineage
+}
+
+/// The commits hidden by `roots` and, as in Sapling, everything built on them, except commits
+/// in `protected`, which stay visible so the checked-out commit never disappears.
+fn hidden_closure(
+    parents: &HashMap<Oid, Option<Oid>>,
+    roots: &HashSet<Oid>,
+    protected: &HashSet<Oid>,
+) -> HashSet<Oid> {
+    let mut closure: HashSet<Oid> = roots.difference(protected).copied().collect();
+    loop {
+        let before = closure.len();
+        for (child, parent) in parents {
+            if !protected.contains(child) && parent.is_some_and(|parent| closure.contains(&parent))
+            {
+                closure.insert(*child);
+            }
+        }
+        if closure.len() == before {
+            return closure;
+        }
+    }
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
@@ -534,6 +572,10 @@ pub struct Smartlog {
     selection_anchor: Option<Oid>,
     head: Option<Oid>,
     parents: HashMap<Oid, Option<Oid>>,
+    hidden: HashSet<Oid>,
+    hidden_closure: HashSet<Oid>,
+    protected_from_hiding: HashSet<Oid>,
+    show_hidden: bool,
     pending_selection: Option<Oid>,
     sidebar: SidebarState,
     uncommitted_files: Vec<StatusEntry>,
@@ -601,6 +643,10 @@ impl Smartlog {
             selection_anchor: None,
             head: None,
             parents: HashMap::default(),
+            hidden: HashSet::default(),
+            hidden_closure: HashSet::default(),
+            protected_from_hiding: HashSet::default(),
+            show_hidden: false,
             pending_selection: None,
             sidebar,
             uncommitted_files: Vec::new(),
@@ -649,12 +695,30 @@ impl Smartlog {
             .collect();
         self.deselected.retain(|path| present_paths.contains(path));
 
-        let drafts: Vec<(Oid, Option<Oid>)> = draft_commits
+        let mut drafts: Vec<(Oid, Option<Oid>)> = draft_commits
             .iter()
             .map(|commit| (commit.sha, commit.parents.first().copied()))
             .collect();
         for commit in &draft_commits {
             self.ref_names.insert(commit.sha, commit.ref_names.clone());
+        }
+
+        let all_parents: HashMap<Oid, Option<Oid>> = drafts.iter().copied().collect();
+        self.hidden = draft_commits
+            .iter()
+            .filter(|commit| {
+                commit
+                    .ref_names
+                    .iter()
+                    .any(|name| name.starts_with(HIDDEN_COMMIT_REF_PREFIX))
+            })
+            .map(|commit| commit.sha)
+            .collect();
+        self.protected_from_hiding = lineage_of(&all_parents, head);
+        self.hidden_closure =
+            hidden_closure(&all_parents, &self.hidden, &self.protected_from_hiding);
+        if !self.show_hidden {
+            drafts.retain(|(sha, _)| !self.hidden_closure.contains(sha));
         }
         self.parents = drafts.iter().copied().collect();
 
@@ -775,6 +839,46 @@ impl Smartlog {
         self.selection = selection;
         self.selection_anchor = anchor;
         self.sync_sidebar(window, cx);
+    }
+
+    fn hide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            "Hide this commit and everything built on it?",
+            Some("The commits stay in git and can be shown again with Show hidden."),
+            &["Hide", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+            repository
+                .update(cx, |repository, _| {
+                    repository.set_commit_hidden(sha.to_string(), true)
+                })
+                .await??;
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to hide commit", window, cx, |_, _, _| None);
+    }
+
+    fn unhide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.set_commit_hidden(sha.to_string(), false)
+                })
+                .await??;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to show commit", window, cx, |_, _, _| None);
     }
 
     fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
@@ -1676,6 +1780,12 @@ impl Smartlog {
             None
         };
         let trunk_name = self.trunk.clone();
+        let is_hidden = sha.is_some_and(|sha| self.hidden_closure.contains(&sha));
+        let is_hidden_root = sha.is_some_and(|sha| self.hidden.contains(&sha));
+        let can_hide = row.kind == RowKind::Draft
+            && sha.is_some_and(|sha| {
+                !self.protected_from_hiding.contains(&sha) && !self.hidden_closure.contains(&sha)
+            });
 
         let summary = match (row.kind, sha) {
             (RowKind::Terminator | RowKind::Link, _) => h_flex(),
@@ -1738,6 +1848,7 @@ impl Smartlog {
 
         h_flex()
             .id(("smartlog-row", index))
+            .when(is_hidden, |this| this.opacity(0.5))
             .h(ROW_HEIGHT)
             .w_full()
             .group("smartlog-row")
@@ -1770,6 +1881,28 @@ impl Smartlog {
                                     ))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.uncommit(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(can_hide, |this| {
+                            this.child(
+                                IconButton::new(("smartlog-hide", index), IconName::EyeOff)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Hide commit and descendants"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.hide_commit(sha, window, cx);
+                                    })),
+                            )
+                        })
+                        .when(is_hidden_root, |this| {
+                            this.child(
+                                IconButton::new(("smartlog-unhide", index), IconName::Eye)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Show commit again"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.unhide_commit(sha, window, cx);
                                     })),
                             )
                         })
@@ -1853,12 +1986,43 @@ impl Render for Smartlog {
                     }),
             )
             .child(
-                IconButton::new("smartlog-refresh", IconName::ArrowCircle)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Refresh"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.refresh(window, cx);
-                    })),
+                h_flex()
+                    .gap_2()
+                    .when(!self.hidden.is_empty(), |this| {
+                        this.child(
+                            Button::new(
+                                "smartlog-toggle-hidden",
+                                if self.show_hidden {
+                                    format!("Hide {} hidden", self.hidden.len())
+                                } else {
+                                    format!("Show {} hidden", self.hidden.len())
+                                },
+                            )
+                            .start_icon(
+                                Icon::new(if self.show_hidden {
+                                    IconName::EyeOff
+                                } else {
+                                    IconName::Eye
+                                })
+                                .size(IconSize::Small),
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.show_hidden = !this.show_hidden;
+                                    this.refresh(window, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        IconButton::new("smartlog-refresh", IconName::ArrowCircle)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Refresh"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.refresh(window, cx);
+                            })),
+                    ),
             );
 
         let sidebar_open = !self.sidebar.collapsed;
@@ -2173,6 +2337,33 @@ mod tests {
 
         let (selection, _) = apply_click(&rows, &set(&[1]), Some(oid(1)), oid(2), false, true);
         assert_eq!(selection, set(&[2]));
+    }
+
+    #[test]
+    fn hiding_a_commit_hides_everything_built_on_it() {
+        let (trunk, a, b, c, other) = (oid(1), oid(2), oid(3), oid(4), oid(5));
+        let parents = parents_of(&[
+            (a, Some(trunk)),
+            (b, Some(a)),
+            (c, Some(b)),
+            (other, Some(trunk)),
+        ]);
+
+        let closure = hidden_closure(&parents, &set(&[3]), &HashSet::default());
+        assert_eq!(closure, set(&[3, 4]));
+        assert!(!closure.contains(&other));
+    }
+
+    #[test]
+    fn the_checked_out_lineage_is_never_hidden() {
+        let (trunk, a, b, c) = (oid(1), oid(2), oid(3), oid(4));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (c, Some(b))]);
+
+        let protected = lineage_of(&parents, Some(b));
+        assert_eq!(protected, set(&[3, 2, 1]));
+
+        assert_eq!(hidden_closure(&parents, &set(&[2]), &protected), set(&[]));
+        assert_eq!(hidden_closure(&parents, &set(&[4]), &protected), set(&[4]));
     }
 
     #[test]

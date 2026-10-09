@@ -40,8 +40,8 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
-        LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
+        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
+        HIDDEN_COMMIT_REF_PREFIX, InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
         SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
         is_binary_content,
     },
@@ -9554,6 +9554,49 @@ impl Repository {
         commit: String,
     ) -> oneshot::Receiver<Result<()>> {
         self.create_ref(format!("refs/tags/{tag_name}"), commit)
+    }
+
+    /// Hides or shows a commit in the Smartlog by creating or deleting its marker ref.
+    pub fn set_commit_hidden(
+        &mut self,
+        sha: String,
+        hidden: bool,
+    ) -> oneshot::Receiver<Result<()>> {
+        let ref_name = format!("{HIDDEN_COMMIT_REF_PREFIX}{sha}");
+        if hidden {
+            return self.create_ref(ref_name, sha);
+        }
+
+        let id = self.id;
+        let this = self.this.clone();
+        self.send_job(
+            "unhide_commit",
+            Some(format!("git update-ref -d {ref_name}").into()),
+            move |repo, mut cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.delete_ref(ref_name).await?;
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitEditRef {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                ref_name,
+                                action: Some(proto::git_edit_ref::Action::Delete(
+                                    proto::git_edit_ref::DeleteRef {},
+                                )),
+                            })
+                            .await?;
+                    }
+                }
+
+                this.update(&mut cx, |_, cx| {
+                    cx.emit(RepositoryEvent::TagsChanged);
+                })?;
+                Ok(())
+            },
+        )
     }
 
     fn edit_ref(
