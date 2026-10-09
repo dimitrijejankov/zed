@@ -2000,6 +2000,20 @@ impl Smartlog {
         let trunk = self.trunk.clone();
         let trunk_choices = self.trunk_choices(cx);
         let current_branch = self.current_branch(cx);
+        let all_branches: Vec<String> = self
+            .trunk_choices(cx)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| {
+                self.repository(cx).is_some_and(|repository| {
+                    repository
+                        .read(cx)
+                        .branch_list
+                        .iter()
+                        .any(|branch| !branch.is_remote() && branch.name() == name)
+                })
+            })
+            .collect();
         let branches_here: Vec<String> = self
             .local_branches_at(sha, cx)
             .into_iter()
@@ -2170,6 +2184,59 @@ impl Smartlog {
                         }
                     }
                     menu.separator()
+                })
+                .submenu("Switch Branch", {
+                    let smartlog = smartlog.clone();
+                    let branches = all_branches.clone();
+                    let current = current_branch.clone();
+                    move |mut menu, _, _| {
+                        for name in &branches {
+                            menu = menu.toggleable_entry(
+                                name.clone(),
+                                current.as_deref() == Some(name.as_str()),
+                                IconPosition::Start,
+                                None,
+                                {
+                                    let smartlog = smartlog.clone();
+                                    let name = name.clone();
+                                    move |window, cx| {
+                                        smartlog
+                                            .update(cx, |this, cx| {
+                                                this.switch_to(name.clone(), window, cx)
+                                            })
+                                            .log_err();
+                                    }
+                                },
+                            );
+                        }
+                        menu
+                    }
+                })
+                .when(can_merge, |menu| {
+                    menu.submenu("Merge Branch Into Current", {
+                        let smartlog = smartlog.clone();
+                        let branches: Vec<String> = all_branches
+                            .iter()
+                            .filter(|name| Some(*name) != current_branch.as_ref())
+                            .cloned()
+                            .collect();
+                        move |mut menu, _, _| {
+                            for name in &branches {
+                                menu = menu.entry(name.clone(), None, {
+                                    let smartlog = smartlog.clone();
+                                    let name = name.clone();
+                                    move |window, cx| {
+                                        smartlog
+                                            .update(cx, |this, cx| {
+                                                this.merge_into_current(name.clone(), window, cx)
+                                            })
+                                            .log_err();
+                                    }
+                                });
+                            }
+                            menu
+                        }
+                    })
                 })
                 .submenu("Set Trunk", {
                     let smartlog = smartlog.clone();
