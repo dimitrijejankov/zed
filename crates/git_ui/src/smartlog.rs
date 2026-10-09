@@ -447,20 +447,8 @@ struct RebasePlan {
     branch: Option<String>,
 }
 
-/// Decides how the stack rooted at `root` can be rebased onto the trunk. A stack containing
-/// `HEAD` is rebased in place. Any other stack needs exactly one tip with a local branch,
-/// because `git rebase` moves a single branch at a time.
-fn plan_rebase(
-    parents: &HashMap<Oid, Option<Oid>>,
-    head: Option<Oid>,
-    root: Oid,
-    local_branch_at: impl Fn(Oid) -> Option<String>,
-) -> Option<RebasePlan> {
-    let old_base = parents.get(&root).copied().flatten()?;
-    if parents.contains_key(&old_base) {
-        return None;
-    }
-
+/// `root` and every commit built on it.
+fn stack_members(parents: &HashMap<Oid, Option<Oid>>, root: Oid) -> HashSet<Oid> {
     let mut members: HashSet<Oid> = HashSet::default();
     members.insert(root);
     loop {
@@ -471,9 +459,22 @@ fn plan_rebase(
             }
         }
         if members.len() == before {
-            break;
+            return members;
         }
     }
+}
+
+/// How `root` and everything built on it can be rebased. A subtree containing `HEAD` is rebased
+/// in place. Any other subtree needs exactly one tip with a local branch, because `git rebase`
+/// moves a single branch at a time.
+fn plan_subtree_rebase(
+    parents: &HashMap<Oid, Option<Oid>>,
+    head: Option<Oid>,
+    root: Oid,
+    local_branch_at: impl Fn(Oid) -> Option<String>,
+) -> Option<RebasePlan> {
+    let old_base = parents.get(&root).copied().flatten()?;
+    let members = stack_members(parents, root);
 
     if head.is_some_and(|head| members.contains(&head)) {
         return Some(RebasePlan {
@@ -494,6 +495,35 @@ fn plan_rebase(
         old_base,
         branch: Some(local_branch_at(tip)?),
     })
+}
+
+/// Decides how the stack rooted at `root`, whose parent is on the trunk, can be rebased onto
+/// the trunk.
+fn plan_rebase(
+    parents: &HashMap<Oid, Option<Oid>>,
+    head: Option<Oid>,
+    root: Oid,
+    local_branch_at: impl Fn(Oid) -> Option<String>,
+) -> Option<RebasePlan> {
+    let old_base = parents.get(&root).copied().flatten()?;
+    if parents.contains_key(&old_base) {
+        return None;
+    }
+    plan_subtree_rebase(parents, head, root, local_branch_at)
+}
+
+/// Decides whether dropping `source` and its descendants onto `target` is a real, possible move:
+/// not into itself, not where it already is, and with a way to run it.
+fn plan_drag_rebase(
+    parents: &HashMap<Oid, Option<Oid>>,
+    head: Option<Oid>,
+    source: Oid,
+    target: Oid,
+    local_branch_at: impl Fn(Oid) -> Option<String>,
+) -> Option<RebasePlan> {
+    let plan = plan_subtree_rebase(parents, head, source, local_branch_at)?;
+    let moved = stack_members(parents, source);
+    (!moved.contains(&target) && target != plan.old_base).then_some(plan)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -865,6 +895,30 @@ fn operation_name(failure_title: &str) -> String {
     match characters.next() {
         Some(first) => first.to_uppercase().chain(characters).collect(),
         None => String::new(),
+    }
+}
+
+#[derive(Clone)]
+struct DraggedCommit {
+    sha: Oid,
+    label: SharedString,
+}
+
+struct DraggedCommitPreview {
+    label: SharedString,
+}
+
+impl Render for DraggedCommitPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
     }
 }
 
@@ -2067,6 +2121,57 @@ impl Smartlog {
         self.run_logged("Failed to amend changes to commit", task, window, cx);
     }
 
+    fn drag_rebase_plan(&self, source: Oid, target: Oid, cx: &App) -> Option<RebasePlan> {
+        plan_drag_rebase(&self.parents, self.head, source, target, |tip| {
+            self.local_branch_at(tip, cx)
+        })
+    }
+
+    /// Handles dropping a commit and its descendants onto `target`, after asking.
+    fn rebase_dragged(
+        &mut self,
+        source: Oid,
+        target: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rebase_in_progress(cx) {
+            return;
+        }
+        let Some(plan) = self.drag_rebase_plan(source, target, cx) else {
+            return;
+        };
+        let count = stack_members(&self.parents, source).len();
+        let target_label = self.commits.get(&target).map_or_else(
+            || target.display_short(),
+            |commit| commit.subject.to_string(),
+        );
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!(
+                "Rebase {} onto {target_label}?",
+                if count == 1 {
+                    "this commit".to_string()
+                } else {
+                    format!("these {count} commits")
+                }
+            ),
+            None,
+            &["Rebase", "Cancel"],
+            cx,
+        );
+        let this = cx.weak_entity();
+        cx.spawn_in(window, async move |_, cx| {
+            if prompt.await? == 0 {
+                this.update_in(cx, |this, window, cx| {
+                    this.rebase_stack_onto(plan, target.to_string(), window, cx);
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn rebase_stack(&mut self, plan: RebasePlan, window: &mut Window, cx: &mut Context<Self>) {
         let trunk = self.trunk.to_string();
         self.rebase_stack_onto(plan, trunk, window, cx);
@@ -3090,6 +3195,15 @@ impl Smartlog {
             None
         };
         let trunk_name = self.trunk.clone();
+        let drag_payload = match (row.kind, sha) {
+            (RowKind::Draft, Some(sha)) if !self.rebase_in_progress(cx) => {
+                self.commits.get(&sha).map(|commit| DraggedCommit {
+                    sha,
+                    label: commit.subject.clone(),
+                })
+            }
+            _ => None,
+        };
         let is_hidden = sha.is_some_and(|sha| self.hidden_closure.contains(&sha));
         let filter = self.filter_text(cx);
         let matches_filter = sha.is_none_or(|sha| self.matches_filter(sha, &filter));
@@ -3152,6 +3266,22 @@ impl Smartlog {
         h_flex()
             .id(("smartlog-row", index))
             .when(is_hidden, |this| this.opacity(0.5))
+            .when_some(drag_payload, |this, payload| {
+                this.on_drag(payload, |dragged, _, _, cx| {
+                    let label = dragged.label.clone();
+                    cx.new(|_| DraggedCommitPreview { label })
+                })
+            })
+            .when_some(sha, |this, target| {
+                this.drag_over::<DraggedCommit>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener(
+                    move |this, dragged: &DraggedCommit, window, cx| {
+                        this.rebase_dragged(dragged.sha, target, window, cx);
+                    },
+                ))
+            })
             .when(!matches_filter, |this| this.opacity(0.3))
             .on_mouse_down(
                 MouseButton::Right,
@@ -4059,6 +4189,37 @@ mod tests {
         assert_eq!(short_duration(Duration::from_secs(59 * 60)), "59m");
         assert_eq!(short_duration(Duration::from_secs(2 * 3600 + 5)), "2h");
         assert_eq!(short_duration(Duration::from_secs(3 * 86_400)), "3d");
+    }
+
+    #[test]
+    fn dragging_a_commit_moves_it_and_what_is_built_on_it() {
+        let (trunk, a, b, c, other) = (oid(1), oid(2), oid(3), oid(4), oid(5));
+        let parents = parents_of(&[
+            (a, Some(trunk)),
+            (b, Some(a)),
+            (c, Some(b)),
+            (other, Some(trunk)),
+        ]);
+
+        let plan = plan_drag_rebase(&parents, Some(c), b, other, |_| None).unwrap();
+        assert_eq!(
+            plan,
+            RebasePlan {
+                old_base: a,
+                branch: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_commit_cannot_be_dropped_onto_itself_its_descendants_or_its_parent() {
+        let (trunk, a, b, c) = (oid(1), oid(2), oid(3), oid(4));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (c, Some(b))]);
+
+        assert_eq!(plan_drag_rebase(&parents, Some(c), b, b, |_| None), None);
+        assert_eq!(plan_drag_rebase(&parents, Some(c), b, c, |_| None), None);
+        assert_eq!(plan_drag_rebase(&parents, Some(c), b, a, |_| None), None);
+        assert!(plan_drag_rebase(&parents, Some(c), b, trunk, |_| None).is_some());
     }
 
     #[test]
