@@ -1766,7 +1766,7 @@ impl GitRepository for FakeGitRepository {
         self.edit_ref(RefEdit::Delete { ref_name })
     }
 
-    fn reword_commit(&self, _sha: String, _message: String) -> BoxFuture<'_, Result<()>> {
+    fn reword_commit(&self, _sha: String, _message: String) -> BoxFuture<'_, Result<String>> {
         async { anyhow::bail!("rewording commits is not supported by the fake repository") }.boxed()
     }
 

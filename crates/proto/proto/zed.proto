@@ -525,7 +525,8 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495;
-    GitRewordCommit git_reword_commit = 496; // current max
+    GitRewordCommit git_reword_commit = 496;
+    GitRewordCommitResponse git_reword_commit_response = 497; // current max
   }
 
   reserved 87 to 88;

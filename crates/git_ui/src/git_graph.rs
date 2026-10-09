@@ -74,7 +74,7 @@ const LEFT_PADDING: Pixels = px(12.0);
 const LINE_WIDTH: Pixels = px(2.0);
 const REF_LABEL_GUTTER_MIN_WIDTH: Pixels = px(240.0);
 const REF_LABEL_GUTTER_MAX_WIDTH: Pixels = px(280.0);
-const RESIZE_HANDLE_WIDTH: f32 = 8.0;
+pub(crate) const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 const TREE_INDENT: f32 = 20.0;
@@ -101,7 +101,7 @@ impl CopiedState {
     }
 }
 
-struct DraggedSplitHandle;
+pub(crate) struct DraggedSplitHandle;
 
 struct CommitTagPicker {
     picker: Entity<Picker<CommitTagPickerDelegate>>,
@@ -211,15 +211,15 @@ impl PickerDelegate for CommitTagPickerDelegate {
 }
 
 #[derive(Clone)]
-struct ChangedFileEntry {
-    status: FileStatus,
-    file_name: SharedString,
-    dir_path: SharedString,
-    repo_path: RepoPath,
+pub(crate) struct ChangedFileEntry {
+    pub(crate) status: FileStatus,
+    pub(crate) file_name: SharedString,
+    pub(crate) dir_path: SharedString,
+    pub(crate) repo_path: RepoPath,
 }
 
 impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
+    pub(crate) fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
         let file_name: SharedString = file
             .path
             .file_name()
@@ -271,7 +271,7 @@ impl ChangedFileEntry {
         );
     }
 
-    fn render(
+    pub(crate) fn render(
         &self,
         ix: usize,
         depth: usize,
@@ -535,24 +535,32 @@ struct SearchState {
     selected_index: Option<usize>,
 }
 
-struct SplitState {
+pub(crate) struct SplitState {
     left_ratio: f32,
     visible_left_ratio: f32,
 }
 
 impl SplitState {
     fn new() -> Self {
+        Self::with_left_ratio(1.0)
+    }
+
+    pub(crate) fn with_left_ratio(left_ratio: f32) -> Self {
         Self {
-            left_ratio: 1.0,
-            visible_left_ratio: 1.0,
+            left_ratio,
+            visible_left_ratio: left_ratio,
         }
     }
 
-    fn right_ratio(&self) -> f32 {
+    pub(crate) fn right_ratio(&self) -> f32 {
         1.0 - self.visible_left_ratio
     }
 
-    fn on_drag_move(
+    pub(crate) fn visible_left_ratio(&self) -> f32 {
+        self.visible_left_ratio
+    }
+
+    pub(crate) fn on_drag_move(
         &mut self,
         drag_event: &DragMoveEvent<DraggedSplitHandle>,
         _window: &mut Window,
@@ -569,11 +577,11 @@ impl SplitState {
         self.visible_left_ratio = new_ratio.clamp(min_ratio, max_ratio);
     }
 
-    fn commit_ratio(&mut self) {
+    pub(crate) fn commit_ratio(&mut self) {
         self.left_ratio = self.visible_left_ratio;
     }
 
-    fn on_double_click(&mut self) {
+    pub(crate) fn on_double_click(&mut self) {
         self.left_ratio = 1.0;
         self.visible_left_ratio = 1.0;
     }
@@ -614,7 +622,7 @@ fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
     })
 }
 
-fn format_timestamp(timestamp: i64) -> String {
+pub(crate) fn format_timestamp(timestamp: i64) -> String {
     let Ok(datetime) = OffsetDateTime::from_unix_timestamp(timestamp) else {
         return "Unknown".to_string();
     };
@@ -1366,7 +1374,7 @@ fn draw_commit_circle(
     );
 }
 
-fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
+pub(crate) fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     diff.files.iter().fold((0, 0), |(added, removed), file| {
         let old_text = file.old_text.as_deref().unwrap_or("");
         let new_text = file.new_text.as_deref().unwrap_or("");

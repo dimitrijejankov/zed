@@ -6,8 +6,9 @@ use git::{
     repository::{CommitOptions, InitialGraphCommitData, LogOrder, LogSource, ResetMode},
 };
 use gpui::{
-    AnyElement, App, ClickEvent, ClipboardItem, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    Pixels, PromptLevel, SharedString, Task, WeakEntity, Window, actions, div, prelude::*, px,
+    AnyElement, App, ClickEvent, ClipboardItem, DefiniteLength, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla, Pixels, PromptLevel, SharedString, Task, WeakEntity, Window, actions, div,
+    prelude::*, px,
 };
 use project::git_store::{
     CommitDataState, GitStore, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
@@ -24,10 +25,19 @@ use workspace::{
     notifications::DetachAndPromptErr as _,
 };
 
-use crate::{commit_view::CommitView, git_panel::GitStatusEntry, solo_diff_view::SoloDiffView};
+use crate::{
+    commit_view::CommitView,
+    git_graph::{DraggedSplitHandle, RESIZE_HANDLE_WIDTH, SplitState},
+    git_panel::GitStatusEntry,
+    solo_diff_view::SoloDiffView,
+};
 use askpass::AskPassDelegate;
 use git::repository::RepoPath;
 use git_ui_core::askpass_modal::AskPassModal;
+
+mod sidebar;
+
+use sidebar::SidebarState;
 
 const ROW_HEIGHT: Pixels = px(48.0);
 const ELBOW_RADIUS: Pixels = px(8.0);
@@ -401,6 +411,9 @@ pub struct Smartlog {
     commits: HashMap<Oid, Arc<git::repository::CommitData>>,
     ref_names: HashMap<Oid, Vec<SharedString>>,
     selected_row: Option<usize>,
+    head: Option<Oid>,
+    pending_selection: Option<Oid>,
+    sidebar: SidebarState,
     uncommitted_files: Vec<StatusEntry>,
     /// Files the user unchecked. Everything else is included by Commit and Amend, so files that
     /// appear later are selected by default, as in ISL.
@@ -433,7 +446,9 @@ impl Smartlog {
             editor
         });
 
-        cx.subscribe(&git_store, |this, _, event, cx| {
+        let sidebar = SidebarState::new(window, cx);
+
+        cx.subscribe_in(&git_store, window, |this, _, event, window, cx| {
             let GitStoreEvent::RepositoryUpdated(updated_id, event, _) = event else {
                 return;
             };
@@ -444,7 +459,7 @@ impl Smartlog {
                 RepositoryEvent::GraphEvent((LogSource::Draft(_), _), _)
                 | RepositoryEvent::HeadChanged
                 | RepositoryEvent::BranchListChanged
-                | RepositoryEvent::StatusesChanged => this.refresh(cx),
+                | RepositoryEvent::StatusesChanged => this.refresh(window, cx),
                 _ => {}
             }
         })
@@ -461,13 +476,16 @@ impl Smartlog {
             commits: HashMap::default(),
             ref_names: HashMap::default(),
             selected_row: None,
+            head: None,
+            pending_selection: None,
+            sidebar,
             uncommitted_files: Vec::new(),
             deselected: HashSet::default(),
             title_editor,
             error: None,
             pending_commit_loads: Vec::new(),
         };
-        this.refresh(cx);
+        this.refresh(window, cx);
         this
     }
 
@@ -479,7 +497,7 @@ impl Smartlog {
             .cloned()
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.repository(cx) else {
             return;
         };
@@ -498,6 +516,7 @@ impl Smartlog {
             .head_commit
             .as_ref()
             .and_then(|commit| commit.sha.parse::<Oid>().ok());
+        self.head = head;
         self.uncommitted_files = repository.read(cx).cached_status().collect();
         let present_paths: HashSet<&RepoPath> = self
             .uncommitted_files
@@ -522,16 +541,33 @@ impl Smartlog {
         self.segments = row_segments(&self.layout);
         self.selected_row = selected_sha
             .and_then(|sha| self.layout.rows.iter().position(|row| row.sha == Some(sha)));
+        if let Some(pending) = self.pending_selection
+            && let Some(row) = self
+                .layout
+                .rows
+                .iter()
+                .position(|row| row.sha == Some(pending))
+        {
+            self.selected_row = Some(row);
+            self.pending_selection = None;
+        }
 
         let shas: Vec<Oid> = self.layout.rows.iter().filter_map(|row| row.sha).collect();
         for sha in shas {
-            self.load_commit(&repository, sha, cx);
+            self.load_commit(&repository, sha, window, cx);
         }
+        self.sync_sidebar(window, cx);
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
 
-    fn load_commit(&mut self, repository: &Entity<Repository>, sha: Oid, cx: &mut Context<Self>) {
+    fn load_commit(
+        &mut self,
+        repository: &Entity<Repository>,
+        sha: Oid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.commits.contains_key(&sha) {
             return;
         }
@@ -543,10 +579,11 @@ impl Smartlog {
                 self.commits.insert(sha, data);
             }
             CommitDataState::Loading(Some(receiver)) => {
-                let task = cx.spawn(async move |this, cx| {
+                let task = cx.spawn_in(window, async move |this, cx| {
                     if let Ok(data) = receiver.await {
-                        this.update(cx, |this, cx| {
+                        this.update_in(cx, |this, window, cx| {
                             this.commits.insert(sha, data);
+                            this.sync_sidebar(window, cx);
                             cx.notify();
                         })
                         .log_err();
@@ -793,34 +830,38 @@ impl Smartlog {
 
     /// Commits (or amends with) exactly the checked files: they are staged and every unchecked
     /// file is unstaged first, because the git index is what a commit is made from.
-    fn commit_selection(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repository) = self.repository(cx) else {
-            return;
-        };
+    fn commit_changes(
+        &mut self,
+        amend: bool,
+        message: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        let repository = self.repository(cx)?;
         let selected = self.selected_paths();
         if selected.is_empty() {
-            return;
+            return None;
         }
         let unselected: Vec<RepoPath> = self.deselected.iter().cloned().collect();
 
-        let message: SharedString = if amend {
-            let Some(head_commit) = repository.read(cx).head_commit.as_ref() else {
-                return;
-            };
-            head_commit.message.clone()
-        } else {
-            let title = self.title_editor.read(cx).text(cx);
-            let title = title.trim();
-            if title.is_empty() {
-                let now = OffsetDateTime::now_utc();
-                let time = time_format::format_local_timestamp(
-                    OffsetDateTime::now_local().unwrap_or(now),
-                    now,
-                    TimestampFormat::EnhancedAbsolute,
-                );
-                format!("Temporary Commit at {time}").into()
-            } else {
-                title.to_string().into()
+        let used_quick_title = message.is_none() && !amend;
+        let message: SharedString = match message {
+            Some(message) => message,
+            None if amend => repository.read(cx).head_commit.as_ref()?.message.clone(),
+            None => {
+                let title = self.title_editor.read(cx).text(cx);
+                let title = title.trim();
+                if title.is_empty() {
+                    let now = OffsetDateTime::now_utc();
+                    let time = time_format::format_local_timestamp(
+                        OffsetDateTime::now_local().unwrap_or(now),
+                        now,
+                        TimestampFormat::EnhancedAbsolute,
+                    );
+                    format!("Temporary Commit at {time}").into()
+                } else {
+                    title.to_string().into()
+                }
             }
         };
 
@@ -833,13 +874,8 @@ impl Smartlog {
             window,
             cx,
         );
-        let failure_title = if amend {
-            "Failed to amend commit"
-        } else {
-            "Failed to commit"
-        };
 
-        cx.spawn_in(window, async move |this, cx| {
+        Some(cx.spawn_in(window, async move |this, cx| {
             repository
                 .update(cx, |repository, cx| repository.stage_entries(selected, cx))
                 .await?;
@@ -865,14 +901,24 @@ impl Smartlog {
                 })
                 .await??;
             this.update_in(cx, |this, window, cx| {
-                if !amend {
+                if used_quick_title {
                     this.title_editor
                         .update(cx, |editor, cx| editor.set_text("", window, cx));
                 }
             })?;
             anyhow::Ok(())
-        })
-        .detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+        }))
+    }
+
+    fn commit_selection(&mut self, amend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let failure_title = if amend {
+            "Failed to amend commit"
+        } else {
+            "Failed to commit"
+        };
+        if let Some(task) = self.commit_changes(amend, None, window, cx) {
+            task.detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+        }
     }
 
     fn discard_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1107,7 +1153,12 @@ impl Smartlog {
             .into_any_element()
     }
 
-    fn render_file(&self, file_index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_file(
+        &self,
+        file_index: usize,
+        place: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(entry) = self.uncommitted_files.get(file_index) else {
             return h_flex().into_any_element();
         };
@@ -1120,7 +1171,7 @@ impl Smartlog {
             Color::Modified
         };
         let is_selected = !self.deselected.contains(&entry.repo_path);
-        let group = SharedString::from(format!("smartlog-file-{file_index}"));
+        let group = SharedString::from(format!("smartlog-{place}-file-{file_index}"));
 
         let checkbox_path = entry.repo_path.clone();
         let diff_entry = entry.clone();
@@ -1261,7 +1312,7 @@ impl Smartlog {
                 .child(Self::you_are_here_pill(cx))
                 .into_any_element(),
             UncommittedPart::Toolbar => self.render_toolbar(cx),
-            UncommittedPart::File(file_index) => self.render_file(file_index, cx),
+            UncommittedPart::File(file_index) => self.render_file(file_index, "main", cx),
             UncommittedPart::Actions => self.render_actions(cx),
         };
 
@@ -1413,6 +1464,7 @@ impl Smartlog {
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.selected_row = Some(index);
+                this.sync_sidebar(window, cx);
                 if let Some(sha) = sha
                     && event.click_count() == 2
                 {
@@ -1425,7 +1477,7 @@ impl Smartlog {
 }
 
 impl Render for Smartlog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows: Vec<AnyElement> = self
             .layout
             .rows
@@ -1457,10 +1509,66 @@ impl Render for Smartlog {
                 IconButton::new("smartlog-refresh", IconName::ArrowCircle)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Refresh"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.refresh(cx);
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.refresh(window, cx);
                     })),
             );
+
+        let sidebar_open = !self.sidebar.collapsed;
+        let list_fraction = self.sidebar.split.read(cx).visible_left_ratio();
+
+        let list = v_flex()
+            .id("smartlog-rows")
+            .h_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .pt(LIST_VERTICAL_PADDING)
+            .pb(LIST_VERTICAL_PADDING)
+            .map(|list| {
+                if sidebar_open {
+                    list.flex_basis(DefiniteLength::Fraction(list_fraction))
+                } else {
+                    list.flex_1()
+                }
+            })
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).color(Color::Error).m_2())
+            })
+            .when(rows.is_empty() && self.error.is_none(), |this| {
+                this.child(
+                    Label::new(format!(
+                        "No draft commits. Everything is already on {}.",
+                        self.trunk
+                    ))
+                    .color(Color::Muted)
+                    .m_2(),
+                )
+            })
+            .children(rows);
+
+        let body = h_flex()
+            .id("smartlog-body")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .on_drag_move::<DraggedSplitHandle>(cx.listener(|this, event, window, cx| {
+                this.sidebar.split.update(cx, |state, cx| {
+                    state.on_drag_move(event, window, cx);
+                });
+            }))
+            .on_drop::<DraggedSplitHandle>(cx.listener(|this, _event, _window, cx| {
+                this.sidebar.split.update(cx, |state, _| {
+                    state.commit_ratio();
+                });
+            }))
+            .child(list)
+            .when(sidebar_open, |this| {
+                this.child(self.render_sidebar_split_handle(cx))
+                    .child(self.render_sidebar(window, cx))
+            })
+            .when(!sidebar_open, |this| {
+                this.child(self.render_collapsed_sidebar(cx))
+            });
 
         v_flex()
             .id("smartlog")
@@ -1469,29 +1577,7 @@ impl Render for Smartlog {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(header)
-            .child(
-                v_flex()
-                    .id("smartlog-rows")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .pt(LIST_VERTICAL_PADDING)
-                    .pb(LIST_VERTICAL_PADDING)
-                    .when_some(self.error.clone(), |this, error| {
-                        this.child(Label::new(error).color(Color::Error).m_2())
-                    })
-                    .when(rows.is_empty() && self.error.is_none(), |this| {
-                        this.child(
-                            Label::new(format!(
-                                "No draft commits. Everything is already on {}.",
-                                self.trunk
-                            ))
-                            .color(Color::Muted)
-                            .m_2(),
-                        )
-                    })
-                    .children(rows),
-            )
+            .child(body)
     }
 }
 

@@ -654,6 +654,10 @@ message GitRewordCommit {
   string message = 4;
 }
 
+message GitRewordCommitResponse {
+  string sha = 1;
+}
+
 message GitRepairWorktrees {
   uint64 project_id = 1;
   uint64 repository_id = 2;

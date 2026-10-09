@@ -4262,19 +4262,19 @@ impl GitStore {
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GitRewordCommit>,
         mut cx: AsyncApp,
-    ) -> Result<proto::Ack> {
+    ) -> Result<proto::GitRewordCommitResponse> {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
         let sha = envelope.payload.sha;
         let message = envelope.payload.message;
 
-        repository_handle
+        let sha = repository_handle
             .update(&mut cx, |repository_handle, _| {
                 repository_handle.reword_commit(sha, message)
             })
             .await??;
 
-        Ok(proto::Ack {})
+        Ok(proto::GitRewordCommitResponse { sha })
     }
 
     async fn handle_repair_worktrees(
@@ -9518,7 +9518,11 @@ impl Repository {
 
     /// Rewrites the message of `sha` and rebuilds the commits that descend from it, without
     /// touching the working tree or the index.
-    pub fn reword_commit(&mut self, sha: String, message: String) -> oneshot::Receiver<Result<()>> {
+    pub fn reword_commit(
+        &mut self,
+        sha: String,
+        message: String,
+    ) -> oneshot::Receiver<Result<String>> {
         let id = self.id;
         self.send_job(
             "reword_commit",
@@ -9529,7 +9533,7 @@ impl Repository {
                         backend.reword_commit(sha, message).await
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                        client
+                        let response = client
                             .request(proto::GitRewordCommit {
                                 project_id: project_id.0,
                                 repository_id: id.to_proto(),
@@ -9537,7 +9541,7 @@ impl Repository {
                                 message,
                             })
                             .await?;
-                        Ok(())
+                        Ok(response.sha)
                     }
                 }
             },

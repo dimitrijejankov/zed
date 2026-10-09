@@ -1149,7 +1149,8 @@ pub trait GitRepository: Send + Sync {
     /// Rewrites the message of `sha` and recreates all of its descendants on top of the new
     /// commit, then moves the local branches (and a detached `HEAD`) that pointed at the old
     /// commits. Commit trees are unchanged, so the working tree and index are left alone.
-    fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<()>>;
+    /// Returns the sha of the reworded commit.
+    fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<String>>;
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
 
@@ -2840,7 +2841,7 @@ impl GitRepository for RealGitRepository {
         self.edit_ref(RefEdit::Delete { ref_name })
     }
 
-    fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<()>> {
+    fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<String>> {
         let git = self.git_binary();
         self.executor
             .spawn(async move { reword_commit_with_git(&git, &sha, &message).await })
@@ -4067,7 +4068,7 @@ impl GitBinary {
     }
 }
 
-async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Result<()> {
+async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Result<String> {
     let target = git
         .run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
         .await?;
@@ -4094,7 +4095,7 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
     let target_parents: Vec<&str> = target_parents.split_whitespace().skip(1).collect();
     let new_target =
         recreate_commit(git, &target, &target_parents, &rewritten, Some(message)).await?;
-    rewritten.insert(target, new_target);
+    rewritten.insert(target.clone(), new_target.clone());
 
     for line in descendants.lines() {
         let mut fields = line.split_whitespace();
@@ -4153,7 +4154,7 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
         moved_refs > 0,
         "No local branch or detached HEAD contains this commit, so it can't be reworded"
     );
-    Ok(())
+    Ok(new_target)
 }
 
 /// Creates a copy of `commit` with the same tree, author and committer, whose parents are the
@@ -7281,10 +7282,14 @@ mod tests {
         fs::write(repo_dir.path().join("untracked.txt"), "keep me").unwrap();
 
         let repository = open_repository(repo_dir.path(), cx);
-        repository
+        let new_middle = repository
             .reword_commit(middle.clone(), "renamed middle\n\nwith a body".to_string())
             .await
             .unwrap();
+        assert_eq!(
+            new_middle,
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD~1"])
+        );
 
         assert_eq!(
             commit_message(repo_dir.path(), "HEAD~1"),
