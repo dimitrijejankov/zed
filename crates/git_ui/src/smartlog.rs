@@ -49,6 +49,7 @@ use git_ui_core::askpass_modal::AskPassModal;
 use workspace::{Toast, notifications::NotificationId};
 
 mod bookmarks;
+mod edit_stack;
 mod persistence;
 mod sidebar;
 
@@ -1863,6 +1864,11 @@ impl Smartlog {
             && !self.protected_from_hiding.contains(&sha)
             && !self.hidden_closure.contains(&sha);
         let is_hidden_root = self.hidden.contains(&sha);
+        let edit_stack = if is_draft {
+            self.editable_stack(sha, cx)
+        } else {
+            None
+        };
         let can_amend_to = is_draft
             && !is_head
             && self.protected_from_hiding.contains(&sha)
@@ -1905,6 +1911,25 @@ impl Smartlog {
                         move |window, cx| {
                             smartlog
                                 .update(cx, |this, cx| this.amend_changes_to(sha, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+                .when_some(edit_stack, |menu, (base, tip, entries)| {
+                    menu.entry("Edit Stack…", None, {
+                        let smartlog = smartlog.clone();
+                        let workspace = workspace.clone();
+                        move |window, cx| {
+                            let smartlog = smartlog.clone();
+                            let entries = entries.clone();
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.toggle_modal(window, cx, |_, cx| {
+                                        edit_stack::EditStackModal::new(
+                                            smartlog, base, tip, entries, cx,
+                                        )
+                                    });
+                                })
                                 .log_err();
                         }
                     })
@@ -2370,6 +2395,73 @@ impl Smartlog {
                 )
         });
         self.show_context_menu(menu, position, window, cx);
+    }
+
+    /// Where `sha` sits in a stack that can be edited, as the modal needs it: the commit the
+    /// stack is based on, its tip, and its commits oldest first.
+    fn editable_stack(
+        &self,
+        sha: Oid,
+        cx: &App,
+    ) -> Option<(Oid, Oid, Vec<edit_stack::StackEntry>)> {
+        if self.rebase_in_progress(cx) {
+            return None;
+        }
+        let mut root = sha;
+        while let Some(parent) = self.parents.get(&root).copied().flatten()
+            && self.parents.contains_key(&parent)
+        {
+            root = parent;
+        }
+        let base = self.parents.get(&root).copied().flatten()?;
+        let chain = edit_stack::linear_stack(&self.parents, root)?;
+        let tip = *chain.last()?;
+        let entries = chain
+            .into_iter()
+            .map(|sha| {
+                let commit = self.commits.get(&sha);
+                edit_stack::StackEntry {
+                    sha,
+                    subject: commit
+                        .map(|commit| commit.subject.clone())
+                        .unwrap_or_else(|| sha.display_short().into()),
+                    message: commit
+                        .map(|commit| commit.message.to_string())
+                        .unwrap_or_default(),
+                    dropped: false,
+                    fold_into_previous: false,
+                }
+            })
+            .collect();
+        Some((base, tip, entries))
+    }
+
+    fn apply_stack_edit(
+        &mut self,
+        base: Oid,
+        tip: Oid,
+        steps: Vec<git::repository::StackStep>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let new_tip = repository
+                .update(cx, |repository, _| {
+                    repository.edit_stack(base.to_string(), tip.to_string(), steps)
+                })
+                .await??;
+            this.update_in(cx, |this, window, cx| {
+                this.selection.clear();
+                this.selection_anchor = None;
+                this.pending_selection = new_tip.parse::<Oid>().ok();
+                this.refresh(window, cx);
+            })?;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to edit the stack", task, window, cx);
     }
 
     fn drag_rebase_plan(&self, source: Oid, target: Oid, cx: &App) -> Option<RebasePlan> {
@@ -4928,5 +5020,184 @@ mod tests {
         workspace.read_with(&*cx, |workspace, cx| {
             assert!(workspace.active_item_as::<Smartlog>(cx).is_some());
         });
+    }
+
+    #[gpui::test]
+    async fn the_smartlog_renders_every_state_without_panicking(cx: &mut gpui::TestAppContext) {
+        use fs::FakeFs;
+        use git::repository::CommitData;
+        use gpui::{VisualContext as _, point};
+        use project::Project;
+        use serde_json::json;
+        use smallvec::smallvec;
+        use std::path::Path;
+
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let (base, first, second, third) = (oid(10), oid(11), oid(12), oid(13));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "a.txt": "changed", "new.txt": "new" }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new("/project/.git"),
+            &[("a.txt", "original".to_string())],
+            third.to_string(),
+        );
+        let graph_commit = |sha: Oid, parent: Oid, refs: &[&str]| {
+            Arc::new(InitialGraphCommitData {
+                sha,
+                parents: smallvec![parent],
+                ref_names: refs
+                    .iter()
+                    .map(|name| SharedString::from(name.to_string()))
+                    .collect(),
+            })
+        };
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![
+                graph_commit(third, second, &["HEAD -> feature"]),
+                graph_commit(second, first, &[]),
+                graph_commit(first, base, &["refs/smartlog/hidden/not-a-real-sha"]),
+            ],
+        );
+        let commit_data = |sha: Oid, parent: Oid, subject: &str| {
+            (
+                CommitData {
+                    sha,
+                    parents: smallvec![parent],
+                    author_name: "Ada".into(),
+                    author_email: "ada@example.com".into(),
+                    commit_timestamp: 1_700_000_000,
+                    subject: subject.to_string().into(),
+                    message: format!("{subject}\n\nA longer description.").into(),
+                },
+                false,
+            )
+        };
+        fs.set_commit_data(
+            Path::new("/project/.git"),
+            [
+                commit_data(third, second, "third"),
+                commit_data(second, first, "second"),
+                commit_data(first, base, "first"),
+                commit_data(base, oid(9), "trunk commit"),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi, _| multi.workspace().clone());
+        let smartlog = cx.new_window_entity(|window, cx| {
+            Smartlog::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace.downgrade(),
+                "main".into(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(smartlog.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        };
+
+        draw(cx);
+        smartlog.read_with(&*cx, |smartlog, _| {
+            assert!(
+                smartlog
+                    .layout
+                    .rows
+                    .iter()
+                    .any(|row| row.sha == Some(third))
+            );
+            assert!(!smartlog.uncommitted_files.is_empty());
+        });
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.click_commit(second, gpui::Modifiers::default(), window, cx);
+        });
+        draw(cx);
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.click_commit(
+                first,
+                gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+        });
+        draw(cx);
+        smartlog.read_with(&*cx, |smartlog, _| assert_eq!(smartlog.selection.len(), 2));
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.click_commit(third, gpui::Modifiers::default(), window, cx);
+            smartlog.set_commit_mode(true, window, cx);
+            smartlog.settings.compact = true;
+            smartlog.show_hidden = true;
+            smartlog.history_expanded = true;
+            cx.notify();
+        });
+        draw(cx);
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            let row = smartlog
+                .layout
+                .rows
+                .iter()
+                .position(|row| row.sha == Some(second))
+                .expect("the second commit has a row");
+            smartlog.deploy_context_menu(point(gpui::px(100.), gpui::px(100.)), row, window, cx);
+            smartlog.deploy_settings_menu(point(gpui::px(10.), gpui::px(10.)), window, cx);
+            smartlog.deploy_bulk_actions_menu(point(gpui::px(10.), gpui::px(10.)), window, cx);
+        });
+        draw(cx);
+
+        let entries = smartlog
+            .read_with(&*cx, |smartlog, cx| smartlog.editable_stack(third, cx))
+            .expect("the stack is a straight line");
+        let (stack_base, tip, entries) = entries;
+        let smartlog_handle = smartlog.downgrade();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |_, cx| {
+                edit_stack::EditStackModal::new(smartlog_handle, stack_base, tip, entries, cx)
+            });
+        });
+        draw(cx);
+
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.sidebar.collapsed = true;
+            smartlog.rebase_in_progress(cx);
+            smartlog.refresh(window, cx);
+        });
+        draw(cx);
     }
 }

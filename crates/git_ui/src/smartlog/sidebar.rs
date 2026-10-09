@@ -294,7 +294,12 @@ impl Smartlog {
         }));
     }
 
-    fn set_commit_mode(&mut self, commit_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_commit_mode(
+        &mut self,
+        commit_mode: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.sidebar.commit_mode == commit_mode {
             return;
         }
