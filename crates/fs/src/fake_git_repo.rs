@@ -1834,6 +1834,18 @@ impl GitRepository for FakeGitRepository {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }
 
+    fn merge_branch(&self, _branch: String) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("merging is not supported by the fake repository") }.boxed()
+    }
+
+    fn merge_continue(&self) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("merging is not supported by the fake repository") }.boxed()
+    }
+
+    fn merge_abort(&self) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("merging is not supported by the fake repository") }.boxed()
+    }
+
     fn rebase_abort(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

@@ -1113,6 +1113,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_absorb);
         client.add_entity_request_handler(Self::handle_range_commit);
         client.add_entity_request_handler(Self::handle_commit_hunks);
+        client.add_entity_request_handler(Self::handle_merge_branch);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4501,6 +4502,30 @@ impl GitStore {
         repository_handle
             .update(&mut cx, |repository_handle, cx| {
                 repository_handle.rebase_continue(cx)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_merge_branch(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitMergeBranch>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let payload = envelope.payload;
+        let step =
+            proto::git_merge_branch::Step::try_from(payload.step).context("unknown merge step")?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| match step {
+                proto::git_merge_branch::Step::Merge => {
+                    repository_handle.merge_branch(payload.branch, cx)
+                }
+                proto::git_merge_branch::Step::Continue => repository_handle.merge_continue(cx),
+                proto::git_merge_branch::Step::Abort => repository_handle.merge_abort(cx),
             })
             .await??;
 
@@ -10220,6 +10245,71 @@ impl Repository {
                 }
             },
         );
+        self.schedule_scan_if_local(cx);
+        receiver
+    }
+
+    /// Merges `branch` into the checked-out branch. A merge that stops on conflicts stays in
+    /// progress.
+    pub fn merge_branch(
+        &mut self,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        self.merge_step(
+            proto::git_merge_branch::Step::Merge,
+            branch,
+            "git merge".to_string(),
+            cx,
+        )
+    }
+
+    pub fn merge_continue(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<Result<()>> {
+        self.merge_step(
+            proto::git_merge_branch::Step::Continue,
+            String::new(),
+            "git merge --continue".to_string(),
+            cx,
+        )
+    }
+
+    pub fn merge_abort(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<Result<()>> {
+        self.merge_step(
+            proto::git_merge_branch::Step::Abort,
+            String::new(),
+            "git merge --abort".to_string(),
+            cx,
+        )
+    }
+
+    fn merge_step(
+        &mut self,
+        step: proto::git_merge_branch::Step,
+        branch: String,
+        status: String,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job("merge", Some(status.into()), move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => match step {
+                    proto::git_merge_branch::Step::Merge => backend.merge_branch(branch).await,
+                    proto::git_merge_branch::Step::Continue => backend.merge_continue().await,
+                    proto::git_merge_branch::Step::Abort => backend.merge_abort().await,
+                },
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    client
+                        .request(proto::GitMergeBranch {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            branch,
+                            step: step.into(),
+                        })
+                        .await?;
+                    Ok(())
+                }
+            }
+        });
         self.schedule_scan_if_local(cx);
         receiver
     }

@@ -1328,6 +1328,14 @@ pub trait GitRepository: Send + Sync {
 
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
+    /// Merges `branch` into the checked-out branch with the default message. If the merge stops
+    /// on conflicts it stays in progress for `merge_continue` or `merge_abort`.
+    fn merge_branch(&self, branch: String) -> BoxFuture<'_, Result<()>>;
+
+    fn merge_continue(&self) -> BoxFuture<'_, Result<()>>;
+
+    fn merge_abort(&self) -> BoxFuture<'_, Result<()>>;
+
     /// The newest commit reachable from `rev` that was made at or before `unix_timestamp`.
     fn commit_before_time(
         &self,
@@ -3218,6 +3226,45 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let git = git?;
                 run_rebase_command(&git, &["rebase".to_string(), "--continue".to_string()]).await
+            })
+            .boxed()
+    }
+
+    fn merge_branch(&self, branch: String) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                run_rebase_command(
+                    &git,
+                    &[
+                        "merge".to_string(),
+                        "--no-edit".to_string(),
+                        branch,
+                        "--".to_string(),
+                    ],
+                )
+                .await
+            })
+            .boxed()
+    }
+
+    fn merge_continue(&self) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                run_rebase_command(&git, &["merge".to_string(), "--continue".to_string()]).await
+            })
+            .boxed()
+    }
+
+    fn merge_abort(&self) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                run_rebase_command(&git, &["merge".to_string(), "--abort".to_string()]).await
             })
             .boxed()
     }
@@ -9704,6 +9751,64 @@ mod tests {
             ),
             "",
             "the branch replaces the kept ref"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_merge_branch_merges_aborts_and_continues(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "f.txt", "base", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "clean"]);
+        commit_file(repo_dir.path(), "clean.txt", "c", "clean change");
+        git_command(repo_dir.path(), ["switch", "-c", "clashing", "main"]);
+        commit_file(repo_dir.path(), "f.txt", "clashing", "clashing change");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        commit_file(repo_dir.path(), "f.txt", "main", "main change");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository.merge_branch("clean".into()).await.unwrap();
+        assert_eq!(
+            git_command_output(
+                repo_dir.path(),
+                ["rev-list", "--parents", "-n", "1", "HEAD"]
+            )
+            .split_whitespace()
+            .count(),
+            3,
+            "a merge commit with two parents"
+        );
+
+        let before = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        let error = repository
+            .merge_branch("clashing".into())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CONFLICT"), "{error}");
+        assert!(repo_dir.path().join(".git/MERGE_HEAD").exists());
+
+        repository.merge_abort().await.unwrap();
+        assert!(!repo_dir.path().join(".git/MERGE_HEAD").exists());
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
+            before
+        );
+
+        repository
+            .merge_branch("clashing".into())
+            .await
+            .unwrap_err();
+        std::fs::write(repo_dir.path().join("f.txt"), "resolved").unwrap();
+        git_command(repo_dir.path(), ["add", "f.txt"]);
+        repository.merge_continue().await.unwrap();
+        assert!(!repo_dir.path().join(".git/MERGE_HEAD").exists());
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", "HEAD:f.txt"]),
+            "resolved"
         );
     }
 

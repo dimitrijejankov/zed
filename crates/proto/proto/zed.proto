@@ -540,7 +540,8 @@ message Envelope {
     GitAbsorbResponse git_absorb_response = 508;
     GitRangeCommit git_range_commit = 509;
     GitCommitHunks git_commit_hunks = 510;
-    GitCommitHunksResponse git_commit_hunks_response = 511; // current max
+    GitCommitHunksResponse git_commit_hunks_response = 511;
+    GitMergeBranch git_merge_branch = 512; // current max
   }
 
   reserved 87 to 88;

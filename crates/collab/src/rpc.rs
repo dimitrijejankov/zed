@@ -541,6 +541,7 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::GitAbsorb>)
             .add_request_handler(forward_read_only_project_request::<proto::GitRangeCommit>)
             .add_request_handler(forward_read_only_project_request::<proto::GitCommitHunks>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitMergeBranch>)
             .add_request_handler(forward_read_only_project_request::<proto::GitCommitBeforeTime>)
             .add_request_handler(forward_mutating_project_request::<proto::GitRepairWorktrees>)
             .add_request_handler(disallow_guest_request::<proto::GitCreateArchiveCheckpoint>)

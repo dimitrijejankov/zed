@@ -915,6 +915,7 @@ fn short_duration(elapsed: Duration) -> String {
 fn report_rebase_conflicts(
     workspace: &WeakEntity<Workspace>,
     result: anyhow::Result<()>,
+    operation: &'static str,
     cx: &mut gpui::AsyncWindowContext,
 ) -> anyhow::Result<()> {
     match result {
@@ -923,7 +924,9 @@ fn report_rebase_conflicts(
                 workspace.show_toast(
                     Toast::new(
                         NotificationId::unique::<Smartlog>(),
-                        "Rebase stopped on conflicts. Resolve them, then press Continue.",
+                        format!(
+                            "{operation} stopped on conflicts. Resolve them, then press Continue."
+                        ),
                     ),
                     cx,
                 );
@@ -1389,19 +1392,25 @@ impl Smartlog {
         }
     }
 
+    /// Checks out the commit, or its branch when it has one, so `HEAD` isn't left detached.
     fn goto_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self
+            .local_branch_at(sha, cx)
+            .unwrap_or_else(|| sha.to_string());
+        self.switch_to(target, window, cx);
+    }
+
+    fn switch_to(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.repository(cx) else {
             return;
         };
         let task = cx.spawn_in(window, async move |_, cx| {
             repository
-                .update(cx, |repository, _| {
-                    repository.change_branch(sha.to_string())
-                })
+                .update(cx, |repository, _| repository.change_branch(target))
                 .await??;
             anyhow::Ok(())
         });
-        self.run_logged("Failed to go to commit", task, window, cx);
+        self.run_logged("Failed to switch", task, window, cx);
     }
 
     fn row_height(&self) -> Pixels {
@@ -1990,6 +1999,14 @@ impl Smartlog {
             && !self.rebase_in_progress(cx);
         let trunk = self.trunk.clone();
         let trunk_choices = self.trunk_choices(cx);
+        let current_branch = self.current_branch(cx);
+        let branches_here: Vec<String> = self
+            .local_branches_at(sha, cx)
+            .into_iter()
+            .filter(|branch| Some(branch) != current_branch.as_ref())
+            .collect();
+        let can_merge =
+            current_branch.is_some() && !self.rebase_in_progress(cx) && !self.merge_in_progress(cx);
         let copy_text = self.copy_hash_text(sha);
         let smartlog = cx.entity().downgrade();
         let workspace = self.workspace.clone();
@@ -2123,6 +2140,36 @@ impl Smartlog {
                             })
                             .log_err();
                     }
+                })
+                .when(!branches_here.is_empty(), |menu| {
+                    let mut menu = menu.separator();
+                    for branch in &branches_here {
+                        menu = menu.entry(format!("Switch to {branch}"), None, {
+                            let smartlog = smartlog.clone();
+                            let branch = branch.clone();
+                            move |window, cx| {
+                                smartlog
+                                    .update(cx, |this, cx| {
+                                        this.switch_to(branch.clone(), window, cx)
+                                    })
+                                    .log_err();
+                            }
+                        });
+                        if let Some(current) = current_branch.clone().filter(|_| can_merge) {
+                            menu = menu.entry(format!("Merge {branch} into {current}"), None, {
+                                let smartlog = smartlog.clone();
+                                let branch = branch.clone();
+                                move |window, cx| {
+                                    smartlog
+                                        .update(cx, |this, cx| {
+                                            this.merge_into_current(branch.clone(), window, cx)
+                                        })
+                                        .log_err();
+                                }
+                            });
+                        }
+                    }
+                    menu.separator()
                 })
                 .submenu("Set Trunk", {
                     let smartlog = smartlog.clone();
@@ -2352,18 +2399,29 @@ impl Smartlog {
             .collect()
     }
 
-    fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
-        let repository = self.repository(cx)?;
+    fn local_branches_at(&self, sha: Oid, cx: &App) -> Vec<String> {
+        let Some(repository) = self.repository(cx) else {
+            return Vec::new();
+        };
         let repository = repository.read(cx);
-        let ref_names = self.ref_names.get(&sha)?;
-        ref_names.iter().find_map(|ref_name| {
-            let name = ref_name.strip_prefix("HEAD -> ").unwrap_or(ref_name);
-            repository
-                .branch_list
-                .iter()
-                .any(|branch| !branch.is_remote() && branch.name() == name)
-                .then(|| name.to_string())
-        })
+        let Some(ref_names) = self.ref_names.get(&sha) else {
+            return Vec::new();
+        };
+        ref_names
+            .iter()
+            .filter_map(|ref_name| {
+                let name = ref_name.strip_prefix("HEAD -> ").unwrap_or(ref_name);
+                repository
+                    .branch_list
+                    .iter()
+                    .any(|branch| !branch.is_remote() && branch.name() == name)
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
+        self.local_branches_at(sha, cx).into_iter().next()
     }
 
     /// What to rebase for a stack ending at `tip`: its branch, or the commit itself for a stack
@@ -2427,6 +2485,7 @@ impl Smartlog {
         window: &mut Window,
         cx: &mut Context<Self>,
         failure_title: &'static str,
+        operation_name: &'static str,
         operation: impl FnOnce(
             &mut Repository,
             &mut Context<Repository>,
@@ -2441,7 +2500,7 @@ impl Smartlog {
             let result = repository
                 .update(cx, |repository, cx| operation(repository, cx))
                 .await?;
-            report_rebase_conflicts(&workspace, result, cx)
+            report_rebase_conflicts(&workspace, result, operation_name, cx)
         });
         self.run_logged(failure_title, task, window, cx);
     }
@@ -2475,7 +2534,7 @@ impl Smartlog {
                     repository.amend_to(sha.to_string(), cx)
                 })
                 .await?;
-            report_rebase_conflicts(&workspace, result, cx)
+            report_rebase_conflicts(&workspace, result, "Rebase", cx)
         });
         self.run_logged("Failed to amend changes to commit", task, window, cx);
     }
@@ -2533,7 +2592,7 @@ impl Smartlog {
                     })
                     .await?;
                 let stopped = result.as_ref().is_err_and(stopped_on_conflicts);
-                report_rebase_conflicts(&workspace, result, cx)?;
+                report_rebase_conflicts(&workspace, result, "Rebase", cx)?;
                 if stopped {
                     return anyhow::Ok(());
                 }
@@ -2943,9 +3002,15 @@ impl Smartlog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.run_rebase(window, cx, "Failed to rebase", move |repository, cx| {
-            repository.rebase_onto(new_base, plan.old_base.to_string(), plan.branch, cx)
-        });
+        self.run_rebase(
+            window,
+            cx,
+            "Failed to rebase",
+            "Rebase",
+            move |repository, cx| {
+                repository.rebase_onto(new_base, plan.old_base.to_string(), plan.branch, cx)
+            },
+        );
     }
 
     /// The plan for rebasing the stack that contains `HEAD`, if `HEAD` is on one.
@@ -3007,24 +3072,98 @@ impl Smartlog {
     }
 
     fn continue_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merge_in_progress(cx) {
+            self.run_rebase(
+                window,
+                cx,
+                "Failed to finish the merge",
+                "Merge",
+                |repository, cx| repository.merge_continue(cx),
+            );
+            return;
+        }
         self.run_rebase(
             window,
             cx,
             "Failed to continue the rebase",
+            "Rebase",
             |repository, cx| repository.rebase_continue(cx),
         );
     }
 
     fn abort_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merge_in_progress(cx) {
+            self.run_rebase(
+                window,
+                cx,
+                "Failed to abort the merge",
+                "Merge",
+                |repository, cx| repository.merge_abort(cx),
+            );
+            return;
+        }
         self.run_rebase(
             window,
             cx,
             "Failed to abort the rebase",
+            "Rebase",
             |repository, cx| repository.rebase_abort(cx),
         );
     }
 
+    /// A merge that stopped on conflicts: git leaves its message behind until it is finished.
+    fn merge_in_progress(&self, cx: &App) -> bool {
+        !self.rebase_in_progress(cx)
+            && self
+                .repository(cx)
+                .is_some_and(|repository| repository.read(cx).merge.message.is_some())
+    }
+
+    fn current_branch(&self, cx: &App) -> Option<String> {
+        self.repository(cx)?
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string())
+    }
+
+    fn merge_into_current(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rebase_in_progress(cx) || self.merge_in_progress(cx) {
+            return;
+        }
+        let Some(current) = self.current_branch(cx) else {
+            return;
+        };
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Merge {branch} into {current}?"),
+            None,
+            &["Merge", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if prompt.await? == 0 {
+                this.update_in(cx, |this, window, cx| {
+                    this.run_rebase(
+                        window,
+                        cx,
+                        "Failed to merge",
+                        "Merge",
+                        move |repository, cx| repository.merge_branch(branch, cx),
+                    );
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn render_rebase_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let operation = if self.merge_in_progress(cx) {
+            "merge"
+        } else {
+            "rebase"
+        };
         let unresolved = self.unresolved_conflict_count();
         let all_resolved = unresolved == 0;
         let colors = cx.theme().colors();
@@ -3052,7 +3191,7 @@ impl Smartlog {
                     .when(!all_resolved, |this| {
                         this.child(
                             Label::new(format!(
-                                "{unresolved} conflicted files. Resolve conflicts to continue git rebase"
+                                "{unresolved} conflicted files. Resolve conflicts to continue git {operation}"
                             ))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
@@ -4481,9 +4620,10 @@ impl Render for Smartlog {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(header)
-            .when(self.rebase_in_progress(cx), |this| {
-                this.child(self.render_rebase_banner(cx))
-            })
+            .when(
+                self.rebase_in_progress(cx) || self.merge_in_progress(cx),
+                |this| this.child(self.render_rebase_banner(cx)),
+            )
             .child(body)
             .children(self.render_operation_strip(cx))
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -6227,5 +6367,22 @@ mod tests {
                     .any(|(name, current)| name == "main" && !*current)
             );
         });
+
+        let develop_tip = run_git(path, &["rev-parse", "develop"])
+            .parse::<Oid>()
+            .unwrap();
+        smartlog.update_in(cx, |smartlog, window, cx| {
+            smartlog.goto_commit(develop_tip, window, cx);
+        });
+        #[allow(clippy::disallowed_methods)]
+        for _ in 0..40 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            run_git(path, &["symbolic-ref", "-q", "HEAD"]),
+            "refs/heads/develop",
+            "going to a commit with a branch checks the branch out instead of detaching"
+        );
     }
 }
