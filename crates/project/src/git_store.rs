@@ -1106,6 +1106,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_rebase_continue);
         client.add_entity_request_handler(Self::handle_rebase_abort);
         client.add_entity_request_handler(Self::handle_fold_commits);
+        client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
         client.add_entity_stream_request_handler(Self::handle_get_initial_graph_data);
@@ -4261,6 +4262,25 @@ impl GitStore {
         }
 
         Ok(proto::Ack {})
+    }
+
+    async fn handle_commit_before_time(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitCommitBeforeTime>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitCommitBeforeTimeResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let rev = envelope.payload.rev;
+        let unix_timestamp = envelope.payload.unix_timestamp;
+
+        let sha = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.commit_before_time(rev, unix_timestamp)
+            })
+            .await??;
+
+        Ok(proto::GitCommitBeforeTimeResponse { sha })
     }
 
     async fn handle_fold_commits(
@@ -9678,6 +9698,33 @@ impl Repository {
                 }
             },
         )
+    }
+
+    /// The newest commit reachable from `rev` that was made at or before `unix_timestamp`.
+    pub fn commit_before_time(
+        &mut self,
+        rev: String,
+        unix_timestamp: i64,
+    ) -> oneshot::Receiver<Result<Option<String>>> {
+        let id = self.id;
+        self.send_job("commit_before_time", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.commit_before_time(rev, unix_timestamp).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitCommitBeforeTime {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            rev,
+                            unix_timestamp,
+                        })
+                        .await?;
+                    Ok(response.sha)
+                }
+            }
+        })
     }
 
     /// Combines `shas`, an unbroken chain of commits ordered oldest first, into a single commit.

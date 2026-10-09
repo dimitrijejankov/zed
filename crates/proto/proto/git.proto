@@ -680,6 +680,17 @@ message GitFoldCommits {
   string message = 4;
 }
 
+message GitCommitBeforeTime {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string rev = 3;
+  int64 unix_timestamp = 4;
+}
+
+message GitCommitBeforeTimeResponse {
+  optional string sha = 1;
+}
+
 message GitRewordCommitResponse {
   string sha = 1;
 }

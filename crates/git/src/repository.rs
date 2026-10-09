@@ -1180,6 +1180,13 @@ pub trait GitRepository: Send + Sync {
 
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
+    /// The newest commit reachable from `rev` that was made at or before `unix_timestamp`.
+    fn commit_before_time(
+        &self,
+        rev: String,
+        unix_timestamp: i64,
+    ) -> BoxFuture<'_, Result<Option<String>>>;
+
     fn rebase_abort(&self) -> BoxFuture<'_, Result<()>>;
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
@@ -2915,6 +2922,29 @@ impl GitRepository for RealGitRepository {
         let git = self.git_binary();
         self.executor
             .spawn(async move { fold_commits_with_git(&git, &shas, &message).await })
+            .boxed()
+    }
+
+    fn commit_before_time(
+        &self,
+        rev: String,
+        unix_timestamp: i64,
+    ) -> BoxFuture<'_, Result<Option<String>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let sha = git
+                    .run(&[
+                        "rev-list".to_string(),
+                        "-n".to_string(),
+                        "1".to_string(),
+                        format!("--before={unix_timestamp}"),
+                        rev,
+                        "--".to_string(),
+                    ])
+                    .await?;
+                Ok((!sha.is_empty()).then_some(sha))
+            })
             .boxed()
     }
 
@@ -7892,6 +7922,85 @@ mod tests {
             tip.ref_names
                 .iter()
                 .any(|name| name.as_ref().ends_with("feature"))
+        );
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn commit_file_at(directory: &Path, file: &str, date: &str, message: &str) -> String {
+        fs::write(directory.join(file), file).unwrap();
+        git_command(directory, ["add", file]);
+        let output = std::process::Command::new("git")
+            .args(["commit", "-m", message])
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .expect("failed to run git commit");
+        assert!(output.status.success());
+        git_command_output(directory, ["rev-parse", "HEAD"])
+    }
+
+    #[gpui::test]
+    async fn test_commit_before_time_finds_the_newest_commit_at_or_before_it(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let first = commit_file_at(
+            repo_dir.path(),
+            "a.txt",
+            "2020-01-01T00:00:00+00:00",
+            "first",
+        );
+        let second = commit_file_at(
+            repo_dir.path(),
+            "b.txt",
+            "2020-02-01T00:00:00+00:00",
+            "second",
+        );
+        commit_file_at(
+            repo_dir.path(),
+            "c.txt",
+            "2020-03-01T00:00:00+00:00",
+            "third",
+        );
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let timestamp = |iso: &str| {
+            time::OffsetDateTime::parse(iso, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp()
+        };
+
+        assert_eq!(
+            repository
+                .commit_before_time("main".to_string(), timestamp("2020-02-15T00:00:00Z"))
+                .await
+                .unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            repository
+                .commit_before_time("main".to_string(), timestamp("2020-01-01T12:00:00Z"))
+                .await
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            repository
+                .commit_before_time("main".to_string(), timestamp("2019-01-01T00:00:00Z"))
+                .await
+                .unwrap(),
+            None
         );
     }
 }
