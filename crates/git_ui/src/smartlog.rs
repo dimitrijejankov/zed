@@ -34,6 +34,7 @@ use crate::{
 use askpass::AskPassDelegate;
 use git::repository::RepoPath;
 use git_ui_core::askpass_modal::AskPassModal;
+use workspace::{Toast, notifications::NotificationId};
 
 mod sidebar;
 
@@ -400,6 +401,65 @@ fn row_segments(layout: &Layout) -> Vec<Vec<Segment>> {
     segments
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RebasePlan {
+    old_base: Oid,
+    branch: Option<String>,
+}
+
+/// Decides how the stack rooted at `root` can be rebased onto the trunk. A stack containing
+/// `HEAD` is rebased in place. Any other stack needs exactly one tip with a local branch,
+/// because `git rebase` moves a single branch at a time.
+fn plan_rebase(
+    parents: &HashMap<Oid, Option<Oid>>,
+    head: Option<Oid>,
+    root: Oid,
+    local_branch_at: impl Fn(Oid) -> Option<String>,
+) -> Option<RebasePlan> {
+    let old_base = parents.get(&root).copied().flatten()?;
+    if parents.contains_key(&old_base) {
+        return None;
+    }
+
+    let mut members: HashSet<Oid> = HashSet::default();
+    members.insert(root);
+    loop {
+        let before = members.len();
+        for (child, parent) in parents {
+            if parent.is_some_and(|parent| members.contains(&parent)) {
+                members.insert(*child);
+            }
+        }
+        if members.len() == before {
+            break;
+        }
+    }
+
+    if head.is_some_and(|head| members.contains(&head)) {
+        return Some(RebasePlan {
+            old_base,
+            branch: None,
+        });
+    }
+
+    let mut tips = members
+        .iter()
+        .copied()
+        .filter(|member| !parents.values().any(|parent| *parent == Some(*member)));
+    let tip = tips.next()?;
+    if tips.next().is_some() {
+        return None;
+    }
+    Some(RebasePlan {
+        old_base,
+        branch: Some(local_branch_at(tip)?),
+    })
+}
+
+fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
+    error.to_string().contains("CONFLICT")
+}
+
 pub struct Smartlog {
     focus_handle: FocusHandle,
     git_store: Entity<GitStore>,
@@ -412,6 +472,7 @@ pub struct Smartlog {
     ref_names: HashMap<Oid, Vec<SharedString>>,
     selected_row: Option<usize>,
     head: Option<Oid>,
+    parents: HashMap<Oid, Option<Oid>>,
     pending_selection: Option<Oid>,
     sidebar: SidebarState,
     uncommitted_files: Vec<StatusEntry>,
@@ -477,6 +538,7 @@ impl Smartlog {
             ref_names: HashMap::default(),
             selected_row: None,
             head: None,
+            parents: HashMap::default(),
             pending_selection: None,
             sidebar,
             uncommitted_files: Vec::new(),
@@ -532,6 +594,7 @@ impl Smartlog {
         for commit in &draft_commits {
             self.ref_names.insert(commit.sha, commit.ref_names.clone());
         }
+        self.parents = drafts.iter().copied().collect();
 
         let selected_sha = self
             .selected_row
@@ -608,6 +671,158 @@ impl Smartlog {
             anyhow::Ok(())
         })
         .detach_and_prompt_err("Failed to go to commit", window, cx, |_, _, _| None);
+    }
+
+    fn local_branch_at(&self, sha: Oid, cx: &App) -> Option<String> {
+        let repository = self.repository(cx)?;
+        let repository = repository.read(cx);
+        let ref_names = self.ref_names.get(&sha)?;
+        ref_names.iter().find_map(|ref_name| {
+            let name = ref_name.strip_prefix("HEAD -> ").unwrap_or(ref_name);
+            repository
+                .branch_list
+                .iter()
+                .any(|branch| !branch.is_remote() && branch.name() == name)
+                .then(|| name.to_string())
+        })
+    }
+
+    fn rebase_plan(&self, root: Oid, cx: &App) -> Option<RebasePlan> {
+        plan_rebase(&self.parents, self.head, root, |tip| {
+            self.local_branch_at(tip, cx)
+        })
+    }
+
+    fn rebase_in_progress(&self, cx: &App) -> bool {
+        self.repository(cx)
+            .is_some_and(|repository| repository.read(cx).merge.rebase_in_progress)
+    }
+
+    fn unresolved_conflict_count(&self) -> usize {
+        self.uncommitted_files
+            .iter()
+            .filter(|entry| entry.status.is_conflicted())
+            .count()
+    }
+
+    fn run_rebase(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        failure_title: &'static str,
+        operation: impl FnOnce(
+            &mut Repository,
+            &mut Context<Repository>,
+        ) -> futures::channel::oneshot::Receiver<anyhow::Result<()>>
+        + 'static,
+    ) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = repository
+                .update(cx, |repository, cx| operation(repository, cx))
+                .await?;
+            match result {
+                Err(error) if stopped_on_conflicts(&error) => {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(
+                                NotificationId::unique::<Smartlog>(),
+                                "Rebase stopped on conflicts. Resolve them, then press Continue.",
+                            ),
+                            cx,
+                        );
+                    })?;
+                    Ok(())
+                }
+                other => other,
+            }
+        })
+        .detach_and_prompt_err(failure_title, window, cx, |_, _, _| None);
+    }
+
+    fn rebase_stack(&mut self, plan: RebasePlan, window: &mut Window, cx: &mut Context<Self>) {
+        let trunk = self.trunk.to_string();
+        self.run_rebase(window, cx, "Failed to rebase", move |repository, cx| {
+            repository.rebase_onto(trunk, plan.old_base.to_string(), plan.branch, cx)
+        });
+    }
+
+    fn continue_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_rebase(
+            window,
+            cx,
+            "Failed to continue the rebase",
+            |repository, cx| repository.rebase_continue(cx),
+        );
+    }
+
+    fn abort_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_rebase(
+            window,
+            cx,
+            "Failed to abort the rebase",
+            |repository, cx| repository.rebase_abort(cx),
+        );
+    }
+
+    fn render_rebase_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        let unresolved = self.unresolved_conflict_count();
+        let all_resolved = unresolved == 0;
+        let colors = cx.theme().colors();
+
+        h_flex()
+            .flex_none()
+            .w_full()
+            .px_4()
+            .py_2()
+            .gap_3()
+            .justify_between()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .bg(colors.element_background)
+            .child(
+                v_flex()
+                    .child(
+                        Label::new(if all_resolved {
+                            "All Merge Conflicts Resolved"
+                        } else {
+                            "Unresolved Merge Conflicts"
+                        })
+                        .weight(gpui::FontWeight::BOLD),
+                    )
+                    .when(!all_resolved, |this| {
+                        this.child(
+                            Label::new(format!(
+                                "{unresolved} conflicted files. Resolve conflicts to continue git rebase"
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("smartlog-abort-rebase", "Abort")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.abort_rebase(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("smartlog-continue-rebase", "Continue")
+                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                            .disabled(!all_resolved)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.continue_rebase(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn open_commit(&self, sha: Oid, window: &mut Window, cx: &mut App) {
@@ -1171,7 +1386,9 @@ impl Smartlog {
             return h_flex().into_any_element();
         };
         let status = entry.status;
-        let color = if status.is_created() {
+        let color = if status.is_conflicted() {
+            Color::Conflict
+        } else if status.is_created() {
             Color::Created
         } else if status.is_deleted() {
             Color::Deleted
@@ -1349,6 +1566,12 @@ impl Smartlog {
         }
         let is_selected = self.selected_row == Some(index);
         let sha = row.sha;
+        let rebase_plan = if row.kind == RowKind::Draft && !self.rebase_in_progress(cx) {
+            sha.and_then(|sha| self.rebase_plan(sha, cx))
+        } else {
+            None
+        };
+        let trunk_name = self.trunk.clone();
 
         let summary = match (row.kind, sha) {
             (RowKind::Terminator | RowKind::Link, _) => h_flex(),
@@ -1443,6 +1666,17 @@ impl Smartlog {
                                     ))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.uncommit(window, cx);
+                                    })),
+                            )
+                        })
+                        .when_some(rebase_plan, |this, plan| {
+                            this.child(
+                                IconButton::new(("smartlog-rebase", index), IconName::GitBranch)
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text(format!("Rebase onto {}", trunk_name)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.rebase_stack(plan.clone(), window, cx);
                                     })),
                             )
                         })
@@ -1585,6 +1819,9 @@ impl Render for Smartlog {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(header)
+            .when(self.rebase_in_progress(cx), |this| {
+                this.child(self.render_rebase_banner(cx))
+            })
             .child(body)
     }
 }
@@ -1719,6 +1956,74 @@ mod tests {
             column: 0,
             color: 0
         }));
+    }
+
+    fn parents_of(entries: &[(Oid, Option<Oid>)]) -> HashMap<Oid, Option<Oid>> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_stack_containing_head_is_rebased_in_place() {
+        let (trunk, a, b) = (oid(1), oid(2), oid(3));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a))]);
+
+        assert_eq!(
+            plan_rebase(&parents, Some(b), a, |_| None),
+            Some(RebasePlan {
+                old_base: trunk,
+                branch: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_stack_elsewhere_needs_one_tip_with_a_local_branch() {
+        let (trunk, a, b, head) = (oid(1), oid(2), oid(3), oid(9));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (head, Some(trunk))]);
+
+        assert_eq!(
+            plan_rebase(&parents, Some(head), a, |tip| (tip == b)
+                .then(|| "feature".to_string())),
+            Some(RebasePlan {
+                old_base: trunk,
+                branch: Some("feature".to_string())
+            })
+        );
+        assert_eq!(plan_rebase(&parents, Some(head), a, |_| None), None);
+    }
+
+    #[test]
+    fn a_forked_stack_without_head_cannot_be_rebased() {
+        let (trunk, a, b, c, head) = (oid(1), oid(2), oid(3), oid(4), oid(9));
+        let parents = parents_of(&[
+            (a, Some(trunk)),
+            (b, Some(a)),
+            (c, Some(a)),
+            (head, Some(trunk)),
+        ]);
+
+        assert_eq!(
+            plan_rebase(&parents, Some(head), a, |_| Some("branch".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_root_of_a_stack_can_be_rebased() {
+        let (trunk, a, b) = (oid(1), oid(2), oid(3));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a))]);
+
+        assert_eq!(plan_rebase(&parents, Some(b), b, |_| None), None);
+    }
+
+    #[test]
+    fn conflict_output_is_recognised() {
+        assert!(stopped_on_conflicts(&anyhow::anyhow!(
+            "CONFLICT (content): Merge conflict in a.txt\nerror: could not apply abc"
+        )));
+        assert!(!stopped_on_conflicts(&anyhow::anyhow!(
+            "fatal: not a git repository"
+        )));
     }
 
     #[gpui::test]

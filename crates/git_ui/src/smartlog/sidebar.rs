@@ -2,7 +2,6 @@ use super::*;
 use crate::git_graph::{ChangedFileEntry, compute_diff_stats, format_timestamp};
 use project::git_store::CommitDiff;
 use ui::Divider;
-use workspace::{Toast, notifications::NotificationId};
 
 const MIN_SIDEBAR_WIDTH: Pixels = px(300.0);
 const DEFAULT_LIST_FRACTION: f32 = 0.58;
@@ -375,24 +374,16 @@ impl Smartlog {
     }
 
     fn submit_branch(&self, cx: &App) -> Option<String> {
-        let repository = self.repository(cx)?;
-        let repository = repository.read(cx);
         let target = self.sidebar.commit?;
         if self.sidebar_target_is_head() {
+            let repository = self.repository(cx)?;
             return repository
+                .read(cx)
                 .branch
                 .as_ref()
                 .map(|branch| branch.name().to_string());
         }
-        let ref_names = self.ref_names.get(&target)?;
-        ref_names.iter().find_map(|ref_name| {
-            let name = ref_name.strip_prefix("HEAD -> ").unwrap_or(ref_name);
-            repository
-                .branch_list
-                .iter()
-                .any(|branch| !branch.is_remote() && branch.name() == name)
-                .then(|| name.to_string())
-        })
+        self.local_branch_at(target, cx)
     }
 
     fn submit(&mut self, commit_first: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
