@@ -52,9 +52,11 @@ mod bookmarks;
 mod persistence;
 mod sidebar;
 
+use persistence::SmartlogSettings;
 use sidebar::SidebarState;
 
 const ROW_HEIGHT: Pixels = px(48.0);
+const COMPACT_ROW_HEIGHT: Pixels = px(32.0);
 const ELBOW_RADIUS: Pixels = px(8.0);
 const DASH_LENGTH: Pixels = px(4.0);
 const DASH_GAP: Pixels = px(3.0);
@@ -1039,6 +1041,8 @@ pub struct Smartlog {
     protected_from_hiding: HashSet<Oid>,
     show_hidden: bool,
     shelf_collapsed: bool,
+    settings: SmartlogSettings,
+    scroll_to_current_pending: bool,
     last_fetch: Option<SystemTime>,
     last_fetch_task: Option<Task<()>>,
     operations: VecDeque<OperationRecord>,
@@ -1133,6 +1137,8 @@ impl Smartlog {
             protected_from_hiding: HashSet::default(),
             show_hidden: false,
             shelf_collapsed: false,
+            settings: SmartlogSettings::default(),
+            scroll_to_current_pending: true,
             last_fetch: None,
             last_fetch_task: None,
             operations: VecDeque::new(),
@@ -1216,6 +1222,11 @@ impl Smartlog {
 
         self.layout = build_layout(&drafts, head, self.uncommitted_files.len());
         self.segments = row_segments(&self.layout);
+        if self.scroll_to_current_pending && self.settings.scroll_to_current && self.head.is_some()
+        {
+            self.scroll_to_current_commit();
+            self.scroll_to_current_pending = false;
+        }
         let present: HashSet<Oid> = self.layout.rows.iter().filter_map(|row| row.sha).collect();
         self.selection.retain(|sha| present.contains(sha));
         if self
@@ -1319,6 +1330,97 @@ impl Smartlog {
             anyhow::Ok(())
         });
         self.run_logged("Failed to go to commit", task, window, cx);
+    }
+
+    fn row_height(&self) -> Pixels {
+        if self.settings.compact {
+            COMPACT_ROW_HEIGHT
+        } else {
+            ROW_HEIGHT
+        }
+    }
+
+    /// What copying a commit's hash puts on the clipboard, following the setting.
+    fn copy_hash_text(&self, sha: Oid) -> String {
+        if self.settings.copy_short_hash {
+            sha.display_short()
+        } else {
+            sha.to_string()
+        }
+    }
+
+    fn scroll_to_current_commit(&mut self) {
+        if let Some(row) = self
+            .layout
+            .rows
+            .iter()
+            .position(|row| row.is_head && row.sha.is_some())
+        {
+            self.list_scroll_handle.scroll_to_item(row);
+        }
+    }
+
+    fn update_settings(
+        &mut self,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut SmartlogSettings),
+    ) {
+        update(&mut self.settings);
+        cx.emit(ItemEvent::Edit);
+        cx.notify();
+    }
+
+    fn deploy_settings_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let smartlog = cx.entity().downgrade();
+        let focus_handle = self.focus_handle.clone();
+        let settings = self.settings.clone();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let toggle = |label: &'static str, checked: bool, update: fn(&mut SmartlogSettings)| {
+                let smartlog = smartlog.clone();
+                (label, checked, move |_: &mut Window, cx: &mut App| {
+                    smartlog
+                        .update(cx, |this, cx| this.update_settings(cx, update))
+                        .log_err();
+                })
+            };
+            let (label, checked, handler) = toggle(
+                "Click Filename to Open Diff View",
+                settings.click_opens_diff,
+                |settings| settings.click_opens_diff = !settings.click_opens_diff,
+            );
+            let menu = menu
+                .context(focus_handle)
+                .header("Settings")
+                .toggleable_entry(label, checked, IconPosition::Start, None, handler);
+            let (label, checked, handler) = toggle("Compact Mode", settings.compact, |settings| {
+                settings.compact = !settings.compact
+            });
+            let menu = menu.toggleable_entry(label, checked, IconPosition::Start, None, handler);
+            let (label, checked, handler) = toggle(
+                "Scroll to Current Commit on Open",
+                settings.scroll_to_current,
+                |settings| settings.scroll_to_current = !settings.scroll_to_current,
+            );
+            let menu = menu.toggleable_entry(label, checked, IconPosition::Start, None, handler);
+            let (label, checked, handler) = toggle(
+                "Copy Short Commit Hashes",
+                settings.copy_short_hash,
+                |settings| settings.copy_short_hash = !settings.copy_short_hash,
+            );
+            let menu = menu.toggleable_entry(label, checked, IconPosition::Start, None, handler);
+            let (label, checked, handler) = toggle(
+                "Confirm Before Rebasing onto the Trunk",
+                settings.confirm_rebase_onto_trunk,
+                |settings| settings.confirm_rebase_onto_trunk = !settings.confirm_rebase_onto_trunk,
+            );
+            menu.toggleable_entry(label, checked, IconPosition::Start, None, handler)
+        });
+        self.show_context_menu(menu, position, window, cx);
     }
 
     fn selectable_rows(&self) -> Vec<SelectableRow> {
@@ -1760,6 +1862,7 @@ impl Smartlog {
             && !self.selected_paths().is_empty()
             && !self.rebase_in_progress(cx);
         let trunk = self.trunk.clone();
+        let copy_text = self.copy_hash_text(sha);
         let smartlog = cx.entity().downgrade();
         let workspace = self.workspace.clone();
         let focus_handle = self.focus_handle.clone();
@@ -1778,7 +1881,7 @@ impl Smartlog {
                     })
                 })
                 .entry("Copy Hash", None, move |_, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                 })
                 .entry("View Changes in Commit", None, {
                     let smartlog = smartlog.clone();
@@ -2214,6 +2317,17 @@ impl Smartlog {
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
             menu.context(focus_handle)
                 .header("Bulk Actions")
+                .entry("Scroll to Current Commit", None, {
+                    let smartlog = smartlog.clone();
+                    move |_, cx| {
+                        smartlog
+                            .update(cx, |this, cx| {
+                                this.scroll_to_current_commit();
+                                cx.notify();
+                            })
+                            .log_err();
+                    }
+                })
                 .entry("Select All", None, {
                     let smartlog = smartlog.clone();
                     move |window, cx| {
@@ -2304,7 +2418,26 @@ impl Smartlog {
 
     fn rebase_stack(&mut self, plan: RebasePlan, window: &mut Window, cx: &mut Context<Self>) {
         let trunk = self.trunk.to_string();
-        self.rebase_stack_onto(plan, trunk, window, cx);
+        if !self.settings.confirm_rebase_onto_trunk {
+            self.rebase_stack_onto(plan, trunk, window, cx);
+            return;
+        }
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Rebase onto {trunk}?"),
+            None,
+            &["Rebase", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if prompt.await? == 0 {
+                this.update_in(cx, |this, window, cx| {
+                    this.rebase_stack_onto(plan, trunk, window, cx);
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn rebase_stack_onto(
@@ -2510,8 +2643,9 @@ impl Smartlog {
 
     fn render_gutter(&self, row_index: usize, row: &LayoutRow, cx: &App) -> AnyElement {
         let width = LEFT_PADDING * 2.0 + LANE_WIDTH * self.layout.column_count as f32;
-        let half_row = ROW_HEIGHT / 2.0;
-        let mut gutter = div().relative().flex_none().w(width).h(ROW_HEIGHT);
+        let row_height = self.row_height();
+        let half_row = row_height / 2.0;
+        let mut gutter = div().relative().flex_none().w(width).h(row_height);
 
         for segment in self.segments.get(row_index).into_iter().flatten() {
             let line = match *segment {
@@ -2520,7 +2654,7 @@ impl Smartlog {
                     .left(Self::lane_x(column) - LINE_WIDTH / 2.0)
                     .top_0()
                     .w(LINE_WIDTH)
-                    .h(ROW_HEIGHT)
+                    .h(row_height)
                     .bg(self.lane_color(color, cx)),
                 Segment::Down { column, color } => div()
                     .absolute()
@@ -3176,7 +3310,11 @@ impl Smartlog {
                             .truncate(),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_file_diff(&diff_entry, window, cx);
+                        if this.settings.click_opens_diff {
+                            this.open_file_diff(&diff_entry, window, cx);
+                        } else {
+                            this.open_file(&diff_entry.repo_path, window, cx);
+                        }
                     })),
             )
             .child(
@@ -3296,7 +3434,7 @@ impl Smartlog {
 
         h_flex()
             .id(("smartlog-row", index))
-            .h(ROW_HEIGHT)
+            .h(self.row_height())
             .w_full()
             .child(self.render_gutter(index, row, cx))
             .child(
@@ -3325,6 +3463,7 @@ impl Smartlog {
             None
         };
         let trunk_name = self.trunk.clone();
+        let copy_text = sha.map(|sha| self.copy_hash_text(sha)).unwrap_or_default();
         let drag_payload = match (row.kind, sha) {
             (RowKind::Draft, Some(sha)) if !self.rebase_in_progress(cx) => {
                 self.commits.get(&sha).map(|commit| DraggedCommit {
@@ -3419,7 +3558,7 @@ impl Smartlog {
                     this.deploy_context_menu(event.position, index, window, cx);
                 }),
             )
-            .h(ROW_HEIGHT)
+            .h(self.row_height())
             .w_full()
             .group("smartlog-row")
             .when(is_selected, |this| this.bg(colors.element_selected))
@@ -3505,7 +3644,7 @@ impl Smartlog {
                                 .tooltip(Tooltip::text("Copy commit hash"))
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
-                                        sha.to_string(),
+                                        copy_text.clone(),
                                     ));
                                 }),
                         ),
@@ -3585,6 +3724,14 @@ impl Render for Smartlog {
             .child(
                 h_flex()
                     .gap_2()
+                    .child(
+                        IconButton::new("smartlog-settings", IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Settings"))
+                            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                this.deploy_settings_menu(event.position(), window, cx);
+                            })),
+                    )
                     .child(
                         IconButton::new("smartlog-bulk-actions", IconName::PlayFilled)
                             .icon_size(IconSize::Small)
@@ -3892,6 +4039,7 @@ impl workspace::SerializableItem for Smartlog {
             persistence::ratio_to_permille(self.sidebar.split.read(cx).visible_left_ratio());
         let show_hidden = self.show_hidden;
         let filter = Some(self.filter_editor.read(cx).text(cx)).filter(|text| !text.is_empty());
+        let settings = self.settings.to_json();
 
         let database = persistence::SmartlogsDb::global(cx);
         Some(cx.background_spawn(async move {
@@ -3906,6 +4054,7 @@ impl workspace::SerializableItem for Smartlog {
                     sidebar_list_permille,
                     show_hidden,
                     filter,
+                    settings,
                 )
                 .await
         }))
@@ -3928,6 +4077,7 @@ impl Smartlog {
             let ratio = persistence::permille_to_ratio(permille);
             self.sidebar.split = cx.new(|_| SplitState::with_left_ratio(ratio));
         }
+        self.settings = state.settings.clone();
         self.show_hidden = state.show_hidden.unwrap_or(false);
         if let Some(filter) = &state.filter {
             self.filter_editor.update(cx, |editor, cx| {

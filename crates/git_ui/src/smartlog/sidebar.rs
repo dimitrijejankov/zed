@@ -548,6 +548,7 @@ impl Smartlog {
         let is_head = self.sidebar_target_is_head();
         let is_public = self.sidebar_target_is_public();
         let commit = self.commits.get(&sha).cloned();
+        let copy_text = self.copy_hash_text(sha);
 
         h_flex()
             .gap_2()
@@ -603,7 +604,7 @@ impl Smartlog {
                     .end_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
                     .tooltip(Tooltip::text("Copy commit hash"))
                     .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(sha.to_string()));
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                     }),
             )
             .into_any_element()

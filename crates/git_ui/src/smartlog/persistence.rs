@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use db::{
     query,
     sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
@@ -12,26 +14,66 @@ pub(super) struct SmartlogsDb(ThreadSafeConnection);
 impl Domain for SmartlogsDb {
     const NAME: &str = stringify!(SmartlogsDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE smartlogs (
-            workspace_id INTEGER,
-            item_id INTEGER UNIQUE,
-            repo_working_path TEXT,
-            trunk TEXT,
-            selected_sha TEXT,
-            sidebar_collapsed INTEGER,
-            sidebar_list_permille INTEGER,
-            show_hidden INTEGER,
-            filter TEXT,
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE smartlogs (
+                workspace_id INTEGER,
+                item_id INTEGER UNIQUE,
+                repo_working_path TEXT,
+                trunk TEXT,
+                selected_sha TEXT,
+                sidebar_collapsed INTEGER,
+                sidebar_list_permille INTEGER,
+                show_hidden INTEGER,
+                filter TEXT,
 
-            PRIMARY KEY(workspace_id, item_id),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-            ON DELETE CASCADE
-        ) STRICT;
-    )];
+                PRIMARY KEY(workspace_id, item_id),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE smartlogs ADD COLUMN settings TEXT;
+        ),
+    ];
 }
 
 db::static_connection!(SmartlogsDb, [WorkspaceDb]);
+
+/// Per-tab preferences, mirroring the ISL settings that make sense in an editor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct SmartlogSettings {
+    /// Clicking a changed file's name opens its diff rather than the file.
+    pub(super) click_opens_diff: bool,
+    pub(super) compact: bool,
+    pub(super) scroll_to_current: bool,
+    pub(super) copy_short_hash: bool,
+    pub(super) confirm_rebase_onto_trunk: bool,
+}
+
+impl Default for SmartlogSettings {
+    fn default() -> Self {
+        Self {
+            click_opens_diff: true,
+            compact: false,
+            scroll_to_current: true,
+            copy_short_hash: false,
+            confirm_rebase_onto_trunk: false,
+        }
+    }
+}
+
+impl SmartlogSettings {
+    pub(super) fn from_json(json: Option<&str>) -> Self {
+        json.and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn to_json(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
+    }
+}
 
 pub(super) struct SerializedSmartlog {
     pub(super) repo_working_path: PathBuf,
@@ -41,6 +83,7 @@ pub(super) struct SerializedSmartlog {
     pub(super) sidebar_list_permille: Option<i32>,
     pub(super) show_hidden: Option<bool>,
     pub(super) filter: Option<String>,
+    pub(super) settings: SmartlogSettings,
 }
 
 impl SmartlogsDb {
@@ -54,13 +97,14 @@ impl SmartlogsDb {
             sidebar_collapsed: bool,
             sidebar_list_permille: i32,
             show_hidden: bool,
-            filter: Option<String>
+            filter: Option<String>,
+            settings: Option<String>
         ) -> Result<()> {
             INSERT OR REPLACE INTO smartlogs(
                 item_id, workspace_id, repo_working_path, trunk, selected_sha,
-                sidebar_collapsed, sidebar_list_permille, show_hidden, filter
+                sidebar_collapsed, sidebar_list_permille, show_hidden, filter, settings
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         }
     }
 
@@ -75,6 +119,7 @@ impl SmartlogsDb {
             Option<bool>,
             Option<i32>,
             Option<bool>,
+            Option<String>,
             Option<String>
         )>> {
             SELECT
@@ -84,7 +129,8 @@ impl SmartlogsDb {
                 sidebar_collapsed,
                 sidebar_list_permille,
                 show_hidden,
-                filter
+                filter,
+                settings
             FROM smartlogs
             WHERE item_id = ? AND workspace_id = ?
         }
@@ -104,6 +150,7 @@ impl SmartlogsDb {
                 sidebar_list_permille,
                 show_hidden,
                 filter,
+                settings,
             )| SerializedSmartlog {
                 repo_working_path,
                 trunk,
@@ -112,6 +159,7 @@ impl SmartlogsDb {
                 sidebar_list_permille,
                 show_hidden,
                 filter,
+                settings: SmartlogSettings::from_json(settings.as_deref()),
             },
         ))
     }
@@ -156,6 +204,11 @@ mod tests {
                 580,
                 true,
                 Some("fix".to_string()),
+                SmartlogSettings {
+                    compact: true,
+                    ..Default::default()
+                }
+                .to_json(),
             )
             .await
             .unwrap();
@@ -171,6 +224,38 @@ mod tests {
         assert_eq!(loaded.sidebar_list_permille, Some(580));
         assert_eq!(loaded.show_hidden, Some(true));
         assert_eq!(loaded.filter.as_deref(), Some("fix"));
+        assert!(loaded.settings.compact);
+        assert!(loaded.settings.click_opens_diff);
+    }
+
+    #[test]
+    fn settings_round_trip_and_fall_back_to_defaults() {
+        let custom = SmartlogSettings {
+            compact: true,
+            copy_short_hash: true,
+            click_opens_diff: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            SmartlogSettings::from_json(custom.to_json().as_deref()),
+            custom
+        );
+
+        assert_eq!(
+            SmartlogSettings::from_json(None),
+            SmartlogSettings::default()
+        );
+        assert_eq!(
+            SmartlogSettings::from_json(Some("not json")),
+            SmartlogSettings::default()
+        );
+        assert_eq!(
+            SmartlogSettings::from_json(Some(r#"{"compact": true}"#)),
+            SmartlogSettings {
+                compact: true,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
