@@ -626,6 +626,130 @@ fn shelf_entry_label(message: &str) -> &str {
     }
 }
 
+/// Reads what the Goto Time field holds: a number of hours ago, or a local date such as
+/// `2024-05-01`, `2024-05-01 13:30` or `2024-05-01T13:30`.
+fn parse_goto_time(input: &str, now: OffsetDateTime, offset: time::UtcOffset) -> Option<i64> {
+    let input = input.trim();
+    if let Ok(hours) = input.parse::<f64>() {
+        if !hours.is_finite() || hours < 0.0 {
+            return None;
+        }
+        return Some(now.unix_timestamp() - (hours * 3600.0) as i64);
+    }
+
+    let local = [
+        "[year]-[month]-[day] [hour]:[minute]",
+        "[year]-[month]-[day]T[hour]:[minute]",
+    ]
+    .into_iter()
+    .find_map(|description| {
+        let description = time::format_description::parse(description).ok()?;
+        time::PrimitiveDateTime::parse(input, &description).ok()
+    })
+    .or_else(|| {
+        let date_only = time::format_description::parse("[year]-[month]-[day]").ok()?;
+        time::Date::parse(input, &date_only)
+            .ok()
+            .map(|date| date.with_time(time::Time::MIDNIGHT))
+    })?;
+    Some(local.assume_offset(offset).unix_timestamp())
+}
+
+struct GotoTimeModal {
+    editor: Entity<Editor>,
+    rebase_onto_it: bool,
+    smartlog: WeakEntity<Smartlog>,
+}
+
+impl GotoTimeModal {
+    fn new(smartlog: WeakEntity<Smartlog>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Hours ago, or a date like 2024-05-01 13:30", window, cx);
+            editor
+        });
+        Self {
+            editor,
+            rebase_onto_it: false,
+            smartlog,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let input = self.editor.read(cx).text(cx);
+        let Some(timestamp) = parse_goto_time(&input, OffsetDateTime::now_utc(), offset) else {
+            return;
+        };
+        let rebase_onto_it = self.rebase_onto_it;
+        self.smartlog
+            .update(cx, |smartlog, cx| {
+                smartlog.goto_time(timestamp, rebase_onto_it, window, cx);
+            })
+            .log_err();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for GotoTimeModal {}
+impl ModalView for GotoTimeModal {}
+
+impl Focusable for GotoTimeModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for GotoTimeModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("GotoTimeModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::Clock).size(IconSize::XSmall))
+                    .child(Headline::new("Go to Time").size(HeadlineSize::XSmall)),
+            )
+            .child(
+                v_flex()
+                    .px_3()
+                    .pb_3()
+                    .gap_2()
+                    .w_full()
+                    .child(self.editor.clone())
+                    .child(
+                        Checkbox::new(
+                            "smartlog-goto-time-rebase",
+                            if self.rebase_onto_it {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .label("Rebase current work onto it")
+                        .on_click(cx.listener(
+                            |this, state: &ToggleState, _, cx| {
+                                this.rebase_onto_it = *state == ToggleState::Selected;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+    }
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
@@ -1509,9 +1633,77 @@ impl Smartlog {
 
     fn rebase_stack(&mut self, plan: RebasePlan, window: &mut Window, cx: &mut Context<Self>) {
         let trunk = self.trunk.to_string();
+        self.rebase_stack_onto(plan, trunk, window, cx);
+    }
+
+    fn rebase_stack_onto(
+        &mut self,
+        plan: RebasePlan,
+        new_base: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_rebase(window, cx, "Failed to rebase", move |repository, cx| {
-            repository.rebase_onto(trunk, plan.old_base.to_string(), plan.branch, cx)
+            repository.rebase_onto(new_base, plan.old_base.to_string(), plan.branch, cx)
         });
+    }
+
+    /// The plan for rebasing the stack that contains `HEAD`, if `HEAD` is on one.
+    fn head_rebase_plan(&self, cx: &App) -> Option<RebasePlan> {
+        let mut root = self.head?;
+        if !self.parents.contains_key(&root) {
+            return None;
+        }
+        while let Some(parent) = self.parents.get(&root).copied().flatten()
+            && self.parents.contains_key(&parent)
+        {
+            root = parent;
+        }
+        self.rebase_plan(root, cx)
+    }
+
+    fn goto_time(
+        &mut self,
+        unix_timestamp: i64,
+        rebase_onto_it: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let trunk = self.trunk.to_string();
+        let plan = if rebase_onto_it {
+            self.head_rebase_plan(cx)
+        } else {
+            None
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let sha = repository
+                .update(cx, |repository, _| {
+                    repository.commit_before_time(trunk.clone(), unix_timestamp)
+                })
+                .await??
+                .with_context(|| format!("No commit on {trunk} at or before that time"))?;
+
+            match plan {
+                Some(plan) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.rebase_stack_onto(plan, sha, window, cx);
+                    })?;
+                }
+                None if rebase_onto_it => {
+                    anyhow::bail!("There is no draft stack at HEAD to rebase");
+                }
+                None => {
+                    repository
+                        .update(cx, |repository, _| repository.change_branch(sha))
+                        .await??;
+                }
+            }
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to go to that time", window, cx, |_, _, _| None);
     }
 
     fn continue_rebase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2578,6 +2770,21 @@ impl Render for Smartlog {
             .child(
                 h_flex()
                     .gap_2()
+                    .child(
+                        IconButton::new("smartlog-goto-time", IconName::Clock)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Go to a point in time"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let smartlog = cx.weak_entity();
+                                this.workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.toggle_modal(window, cx, |window, cx| {
+                                            GotoTimeModal::new(smartlog, window, cx)
+                                        });
+                                    })
+                                    .log_err();
+                            })),
+                    )
                     .when(!self.hidden.is_empty(), |this| {
                         this.child(
                             Button::new(
@@ -3041,6 +3248,32 @@ mod tests {
             shelf_entry_label("WIP on main: abc1234 Fix it"),
             "WIP on main: abc1234 Fix it"
         );
+    }
+
+    #[test]
+    fn goto_time_accepts_hours_and_local_dates() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let utc = time::UtcOffset::UTC;
+        let plus_two = time::UtcOffset::from_hms(2, 0, 0).unwrap();
+
+        assert_eq!(parse_goto_time("2", now, utc), Some(1_700_000_000 - 7200));
+        assert_eq!(parse_goto_time("0.5", now, utc), Some(1_700_000_000 - 1800));
+        assert_eq!(
+            parse_goto_time("2024-01-02 03:04", now, utc),
+            Some(1_704_164_640)
+        );
+        assert_eq!(
+            parse_goto_time("2024-01-02T03:04", now, utc),
+            Some(1_704_164_640)
+        );
+        assert_eq!(
+            parse_goto_time("2024-01-02 03:04", now, plus_two),
+            Some(1_704_164_640 - 7200)
+        );
+        assert_eq!(parse_goto_time("2024-01-02", now, utc), Some(1_704_153_600));
+        assert_eq!(parse_goto_time("-3", now, utc), None);
+        assert_eq!(parse_goto_time("yesterday", now, utc), None);
+        assert_eq!(parse_goto_time("", now, utc), None);
     }
 
     #[test]
