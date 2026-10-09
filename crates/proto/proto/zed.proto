@@ -529,7 +529,8 @@ message Envelope {
     GitRewordCommitResponse git_reword_commit_response = 497;
     GitRebaseOnto git_rebase_onto = 498;
     GitRebaseContinue git_rebase_continue = 499;
-    GitRebaseAbort git_rebase_abort = 500; // current max
+    GitRebaseAbort git_rebase_abort = 500;
+    GitFoldCommits git_fold_commits = 501; // current max
   }
 
   reserved 87 to 88;

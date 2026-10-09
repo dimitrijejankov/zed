@@ -1775,6 +1775,10 @@ impl GitRepository for FakeGitRepository {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }
 
+    fn fold_commits(&self, _shas: Vec<String>, _message: String) -> BoxFuture<'_, Result<String>> {
+        async { anyhow::bail!("folding commits is not supported by the fake repository") }.boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

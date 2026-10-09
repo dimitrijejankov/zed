@@ -1166,6 +1166,10 @@ pub trait GitRepository: Send + Sync {
         branch: Option<String>,
     ) -> BoxFuture<'_, Result<()>>;
 
+    /// Combines `shas`, an unbroken chain of commits ordered oldest first, into one commit with
+    /// `message`, rebuilding everything on top of them. Returns the sha of the folded commit.
+    fn fold_commits(&self, shas: Vec<String>, message: String) -> BoxFuture<'_, Result<String>>;
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
     fn rebase_abort(&self) -> BoxFuture<'_, Result<()>>;
@@ -2899,6 +2903,13 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn fold_commits(&self, shas: Vec<String>, message: String) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move { fold_commits_with_git(&git, &shas, &message).await })
+            .boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -4160,6 +4171,122 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
         .run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
         .await?;
 
+    let target_parents = git
+        .run(&["rev-list", "--parents", "-n", "1", &target])
+        .await?;
+    let target_parents: Vec<&str> = target_parents.split_whitespace().skip(1).collect();
+    let mut rewritten: HashMap<String, String> = HashMap::default();
+    let new_target = recreate_commit(
+        git,
+        &target,
+        &target_parents,
+        &rewritten,
+        Some(message),
+        None,
+    )
+    .await?;
+    rewritten.insert(target.clone(), new_target.clone());
+
+    replay_descendants(
+        git,
+        &target,
+        rewritten,
+        "No local branch or detached HEAD contains this commit, so it can't be reworded",
+    )
+    .await?;
+    Ok(new_target)
+}
+
+/// Combines a chain of commits, oldest first, into one commit that has the last commit's tree.
+/// Every commit in the chain except the last must have exactly the next one as its only child,
+/// since anything else built on a folded commit would silently change meaning.
+async fn fold_commits_with_git(git: &GitBinary, shas: &[String], message: &str) -> Result<String> {
+    anyhow::ensure!(shas.len() >= 2, "Select at least two commits to fold");
+
+    let mut chain = Vec::with_capacity(shas.len());
+    for sha in shas {
+        chain.push(
+            git.run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+                .await?,
+        );
+    }
+    let (Some(oldest), Some(newest)) = (chain.first(), chain.last()) else {
+        anyhow::bail!("Select at least two commits to fold");
+    };
+
+    let descendants = git
+        .run(&[
+            "rev-list",
+            "--parents",
+            "--ancestry-path",
+            &format!("^{oldest}"),
+            "--branches",
+            "HEAD",
+            "--",
+        ])
+        .await?;
+    let children_of = |parent: &str| -> Vec<&str> {
+        descendants
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let commit = fields.next()?;
+                fields
+                    .any(|candidate| candidate == parent)
+                    .then_some(commit)
+            })
+            .collect()
+    };
+    for pair in chain.windows(2) {
+        let [commit, next] = pair else { continue };
+        anyhow::ensure!(
+            children_of(commit) == [next.as_str()],
+            "These commits can't be folded because other commits are built on top of them"
+        );
+        let next_parents = git.run(&["rev-list", "--parents", "-n", "1", next]).await?;
+        anyhow::ensure!(
+            next_parents.split_whitespace().skip(1).collect::<Vec<_>>() == [commit.as_str()],
+            "These commits can't be folded because they aren't a single chain"
+        );
+    }
+
+    let oldest_parents = git
+        .run(&["rev-list", "--parents", "-n", "1", oldest])
+        .await?;
+    let oldest_parents: Vec<&str> = oldest_parents.split_whitespace().skip(1).collect();
+    let rewritten = HashMap::default();
+    let folded = recreate_commit(
+        git,
+        oldest,
+        &oldest_parents,
+        &rewritten,
+        Some(message),
+        Some(newest),
+    )
+    .await?;
+
+    let rewritten: HashMap<String, String> = chain
+        .iter()
+        .map(|commit| (commit.clone(), folded.clone()))
+        .collect();
+    replay_descendants(
+        git,
+        newest,
+        rewritten,
+        "No local branch or detached HEAD contains these commits, so they can't be folded",
+    )
+    .await?;
+    Ok(folded)
+}
+
+/// Recreates every commit built on `root` on top of its rewritten ancestors, then moves the
+/// local branches and a detached `HEAD` that pointed at any rewritten commit.
+async fn replay_descendants(
+    git: &GitBinary,
+    root: &str,
+    mut rewritten: HashMap<String, String>,
+    no_reference_error: &str,
+) -> Result<()> {
     let descendants = git
         .run(&[
             "rev-list",
@@ -4167,22 +4294,12 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
             "--reverse",
             "--parents",
             "--ancestry-path",
-            &format!("^{target}"),
+            &format!("^{root}"),
             "--branches",
             "HEAD",
             "--",
         ])
         .await?;
-
-    let mut rewritten: HashMap<String, String> = HashMap::default();
-
-    let target_parents = git
-        .run(&["rev-list", "--parents", "-n", "1", &target])
-        .await?;
-    let target_parents: Vec<&str> = target_parents.split_whitespace().skip(1).collect();
-    let new_target =
-        recreate_commit(git, &target, &target_parents, &rewritten, Some(message)).await?;
-    rewritten.insert(target.clone(), new_target.clone());
 
     for line in descendants.lines() {
         let mut fields = line.split_whitespace();
@@ -4190,7 +4307,7 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
             continue;
         };
         let parents: Vec<&str> = fields.collect();
-        let new_commit = recreate_commit(git, commit, &parents, &rewritten, None).await?;
+        let new_commit = recreate_commit(git, commit, &parents, &rewritten, None, None).await?;
         rewritten.insert(commit.to_string(), new_commit);
     }
 
@@ -4210,7 +4327,7 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
             git.run(&[
                 "update-ref",
                 "-m",
-                "reword commit",
+                "rewrite commits",
                 ref_name,
                 new_object,
                 object,
@@ -4227,7 +4344,7 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
                 "update-ref",
                 "--no-deref",
                 "-m",
-                "reword commit",
+                "rewrite commits",
                 "HEAD",
                 new_head,
                 &head,
@@ -4237,21 +4354,20 @@ async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Re
         }
     }
 
-    anyhow::ensure!(
-        moved_refs > 0,
-        "No local branch or detached HEAD contains this commit, so it can't be reworded"
-    );
-    Ok(new_target)
+    anyhow::ensure!(moved_refs > 0, "{no_reference_error}");
+    Ok(())
 }
 
-/// Creates a copy of `commit` with the same tree, author and committer, whose parents are the
-/// `parents` mapped through `rewritten`. The message is kept unless `message` is given.
+/// Creates a copy of `commit` with the same author and committer, whose parents are the
+/// `parents` mapped through `rewritten`. The tree is `commit`'s unless `tree_from` names another
+/// commit, and the message is kept unless `message` is given.
 async fn recreate_commit(
     git: &GitBinary,
     commit: &str,
     parents: &[&str],
     rewritten: &HashMap<String, String>,
     message: Option<&str>,
+    tree_from: Option<&str>,
 ) -> Result<String> {
     let metadata = git
         .run(&[
@@ -4284,7 +4400,10 @@ async fn recreate_commit(
     };
 
     let tree = git
-        .run(&["rev-parse", &format!("{commit}^{{tree}}")])
+        .run(&[
+            "rev-parse",
+            &format!("{}^{{tree}}", tree_from.unwrap_or(commit)),
+        ])
         .await?;
     let message = message.unwrap_or(original_message).trim_end_matches('\n');
 
@@ -7617,6 +7736,99 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
             feature_tip
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fold_commits_combines_a_chain_and_rebuilds_descendants(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        let first = commit_file(repo_dir.path(), "b.txt", "b", "first");
+        let second = commit_file(repo_dir.path(), "c.txt", "c", "second");
+        commit_file(repo_dir.path(), "d.txt", "d", "tip");
+        git_command(repo_dir.path(), ["branch", "on-second", &second]);
+        let tip_tree = git_command_output(repo_dir.path(), ["rev-parse", "HEAD^{tree}"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let folded = repository
+            .fold_commits(vec![first, second], "first and second".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD~1"]),
+            folded
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3"]),
+            "tip\nfirst and second\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD^{tree}"]),
+            tip_tree
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "on-second"]),
+            folded
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", &folded]),
+            "a.txt\nb.txt\nc.txt"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fold_commits_refuses_when_another_commit_is_built_on_the_chain(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        let first = commit_file(repo_dir.path(), "b.txt", "b", "first");
+        git_command(repo_dir.path(), ["switch", "-c", "side"]);
+        commit_file(repo_dir.path(), "side.txt", "s", "side");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        let second = commit_file(repo_dir.path(), "c.txt", "c", "second");
+        let main_before = git_command_output(repo_dir.path(), ["rev-parse", "main"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let error = repository
+            .fold_commits(vec![first, second], "folded".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("built on top of them"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            main_before
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fold_commits_needs_at_least_two_commits(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let only = commit_file(repo_dir.path(), "a.txt", "a", "base");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        assert!(
+            repository
+                .fold_commits(vec![only], "folded".to_string())
+                .await
+                .is_err()
         );
     }
 }

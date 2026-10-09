@@ -1105,6 +1105,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_rebase_onto);
         client.add_entity_request_handler(Self::handle_rebase_continue);
         client.add_entity_request_handler(Self::handle_rebase_abort);
+        client.add_entity_request_handler(Self::handle_fold_commits);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
         client.add_entity_stream_request_handler(Self::handle_get_initial_graph_data);
@@ -4260,6 +4261,25 @@ impl GitStore {
         }
 
         Ok(proto::Ack {})
+    }
+
+    async fn handle_fold_commits(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitFoldCommits>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitRewordCommitResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let shas = envelope.payload.shas;
+        let message = envelope.payload.message;
+
+        let sha = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.fold_commits(shas, message)
+            })
+            .await??;
+
+        Ok(proto::GitRewordCommitResponse { sha })
     }
 
     async fn handle_rebase_onto(
@@ -9603,6 +9623,37 @@ impl Repository {
                                 project_id: project_id.0,
                                 repository_id: id.to_proto(),
                                 sha,
+                                message,
+                            })
+                            .await?;
+                        Ok(response.sha)
+                    }
+                }
+            },
+        )
+    }
+
+    /// Combines `shas`, an unbroken chain of commits ordered oldest first, into a single commit.
+    pub fn fold_commits(
+        &mut self,
+        shas: Vec<String>,
+        message: String,
+    ) -> oneshot::Receiver<Result<String>> {
+        let id = self.id;
+        self.send_job(
+            "fold_commits",
+            Some("git commit-tree".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.fold_commits(shas, message).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let response = client
+                            .request(proto::GitFoldCommits {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                shas,
                                 message,
                             })
                             .await?;

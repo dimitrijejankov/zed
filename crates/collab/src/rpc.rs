@@ -534,6 +534,7 @@ impl Server {
             .add_request_handler(forward_mutating_project_request::<proto::GitRebaseOnto>)
             .add_request_handler(forward_mutating_project_request::<proto::GitRebaseContinue>)
             .add_request_handler(forward_mutating_project_request::<proto::GitRebaseAbort>)
+            .add_request_handler(forward_mutating_project_request::<proto::GitFoldCommits>)
             .add_request_handler(forward_mutating_project_request::<proto::GitRepairWorktrees>)
             .add_request_handler(disallow_guest_request::<proto::GitCreateArchiveCheckpoint>)
             .add_request_handler(disallow_guest_request::<proto::GitRestoreArchiveCheckpoint>)

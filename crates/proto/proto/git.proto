@@ -673,6 +673,13 @@ message GitRebaseAbort {
   uint64 repository_id = 2;
 }
 
+message GitFoldCommits {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  repeated string shas = 3;
+  string message = 4;
+}
+
 message GitRewordCommitResponse {
   string sha = 1;
 }
