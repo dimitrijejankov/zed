@@ -1863,6 +1863,7 @@ impl Smartlog {
         } else {
             None
         };
+        let submit_stack = rebase_plan.is_some() && !self.stack_branches(sha, cx).is_empty();
         let can_hide = is_draft
             && !self.protected_from_hiding.contains(&sha)
             && !self.hidden_closure.contains(&sha);
@@ -1980,6 +1981,16 @@ impl Smartlog {
                             let plan = plan.clone();
                             smartlog
                                 .update(cx, |this, cx| this.rebase_stack(plan, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
+                .when(submit_stack, |menu| {
+                    menu.entry("Submit Stack", None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            smartlog
+                                .update(cx, |this, cx| this.submit_stack(sha, window, cx))
                                 .log_err();
                         }
                     })
@@ -5546,6 +5557,20 @@ mod tests {
             "all five draft commits should be shown before the rebase: {:?}",
             draft_subjects(cx)
         );
+
+        let branches_of_stack = |subject: &str, cx: &mut gpui::VisualTestContext| {
+            smartlog.read_with(&*cx, |smartlog, cx| {
+                let root = smartlog
+                    .commits
+                    .iter()
+                    .find(|(_, commit)| commit.subject.as_ref() == subject)
+                    .map(|(sha, _)| *sha)
+                    .expect("commit is shown");
+                smartlog.stack_branches(root, cx)
+            })
+        };
+        assert_eq!(branches_of_stack("feature one", cx), vec!["feature"]);
+        assert_eq!(branches_of_stack("other one", cx), vec!["other"]);
 
         let plan = smartlog
             .read_with(&*cx, |smartlog, cx| smartlog.head_rebase_plan(cx))

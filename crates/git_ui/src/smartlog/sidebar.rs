@@ -65,6 +65,7 @@ pub(super) struct SidebarState {
     diff_task: Option<Task<()>>,
     load_public_files: bool,
     files_as_tree: bool,
+    collapsed_directories: HashSet<SharedString>,
 }
 
 impl SidebarState {
@@ -94,6 +95,7 @@ impl SidebarState {
             diff_task: None,
             load_public_files: false,
             files_as_tree: false,
+            collapsed_directories: HashSet::default(),
         }
     }
 }
@@ -451,6 +453,87 @@ impl Smartlog {
         self.run_logged("Failed to submit", task, window, cx);
     }
 
+    pub(super) fn stack_branches(&self, root: Oid, cx: &App) -> Vec<String> {
+        let Some(repository) = self.repository(cx) else {
+            return Vec::new();
+        };
+        let members = stack_members(&self.parents, root);
+        let mut branches: Vec<String> = repository
+            .read(cx)
+            .branch_list
+            .iter()
+            .filter(|branch| !branch.is_remote())
+            .filter(|branch| {
+                self.ref_names.iter().any(|(sha, ref_names)| {
+                    members.contains(sha)
+                        && ref_names.iter().any(|ref_name| {
+                            ref_name.strip_prefix("HEAD -> ").unwrap_or(ref_name) == branch.name()
+                        })
+                })
+            })
+            .map(|branch| branch.name().to_string())
+            .collect();
+        branches.sort();
+        branches
+    }
+
+    pub(super) fn submit_stack(&mut self, root: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let branches = self.stack_branches(root, cx);
+        if branches.is_empty() {
+            return;
+        }
+        let mut askpass_delegates: Vec<_> = branches
+            .iter()
+            .map(|_| self.askpass_delegate("git push", window, cx))
+            .collect();
+        let workspace = self.workspace.clone();
+        let task = cx.spawn_in(window, async move |_, cx| {
+            let remotes = repository
+                .update(cx, |repository, _| repository.get_remotes(None, true))
+                .await??;
+            let remote = remotes
+                .into_iter()
+                .next()
+                .context("No remote is available to push to")?;
+            for (branch, askpass) in branches.iter().zip(askpass_delegates.drain(..)) {
+                let has_upstream = repository.read_with(cx, |repository, _| {
+                    repository.branch_list.iter().any(|candidate| {
+                        !candidate.is_remote()
+                            && candidate.name() == branch
+                            && candidate.upstream.is_some()
+                    })
+                });
+                let options = (!has_upstream).then_some(git::repository::PushOptions::SetUpstream);
+                repository
+                    .update(cx, |repository, cx| {
+                        repository.push(
+                            branch.clone().into(),
+                            branch.clone().into(),
+                            remote.name.clone(),
+                            options,
+                            askpass,
+                            cx,
+                        )
+                    })
+                    .await??;
+            }
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<Smartlog>(),
+                        format!("Pushed {} to {}", branches.join(", "), remote.name),
+                    ),
+                    cx,
+                );
+            })?;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to submit the stack", task, window, cx);
+    }
+
     fn open_all_changed_files(&self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(diff) = &self.sidebar.diff else {
             return;
@@ -681,10 +764,43 @@ impl Smartlog {
                     if as_tree {
                         if previous_directory != directory {
                             if let Some(directory) = directory.clone() {
+                                let collapsed =
+                                    self.sidebar.collapsed_directories.contains(&directory);
                                 elements.push(
                                     h_flex()
+                                        .id(SharedString::from(format!(
+                                            "smartlog-directory-{directory}"
+                                        )))
                                         .px_1()
                                         .gap_1()
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(cx.theme().colors().ghost_element_hover)
+                                        })
+                                        .on_click({
+                                            let directory = directory.clone();
+                                            cx.listener(move |this, _, _, cx| {
+                                                if !this
+                                                    .sidebar
+                                                    .collapsed_directories
+                                                    .remove(&directory)
+                                                {
+                                                    this.sidebar
+                                                        .collapsed_directories
+                                                        .insert(directory.clone());
+                                                }
+                                                cx.notify();
+                                            })
+                                        })
+                                        .child(
+                                            Icon::new(if collapsed {
+                                                IconName::ChevronRight
+                                            } else {
+                                                IconName::ChevronDown
+                                            })
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                        )
                                         .child(
                                             Icon::new(IconName::Folder)
                                                 .size(IconSize::Small)
@@ -699,6 +815,12 @@ impl Smartlog {
                                 );
                             }
                             previous_directory = directory.clone();
+                        }
+                        let hidden = directory.as_ref().is_some_and(|directory| {
+                            self.sidebar.collapsed_directories.contains(directory)
+                        });
+                        if hidden {
+                            continue;
                         }
                         elements.push(entry.render(
                             index,
