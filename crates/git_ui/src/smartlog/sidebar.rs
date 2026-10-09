@@ -65,6 +65,7 @@ pub(super) struct SidebarState {
     diff_task: Option<Task<()>>,
     load_public_files: bool,
     files_as_tree: bool,
+    force_submit: bool,
     collapsed_directories: HashSet<SharedString>,
 }
 
@@ -95,6 +96,7 @@ impl SidebarState {
             diff_task: None,
             load_public_files: false,
             files_as_tree: false,
+            force_submit: false,
             collapsed_directories: HashSet::default(),
         }
     }
@@ -121,6 +123,17 @@ fn primary_action(
         (true, true) => PrimaryAction::Commit,
         (true, false) => PrimaryAction::Amend,
         (false, _) => PrimaryAction::AmendMessage,
+    }
+}
+
+/// A forced push wins over setting the upstream, because a push takes only one of the two.
+fn submit_push_options(force: bool, has_upstream: bool) -> Option<git::repository::PushOptions> {
+    if force {
+        Some(git::repository::PushOptions::Force)
+    } else if !has_upstream {
+        Some(git::repository::PushOptions::SetUpstream)
+    } else {
+        None
     }
 }
 
@@ -410,6 +423,7 @@ impl Smartlog {
         let has_upstream = repository.read(cx).branch_list.iter().any(|candidate| {
             !candidate.is_remote() && candidate.name() == branch && candidate.upstream.is_some()
         });
+        let force = self.sidebar.force_submit;
         let askpass = self.askpass_delegate("git push", window, cx);
         let workspace = self.workspace.clone();
 
@@ -426,7 +440,7 @@ impl Smartlog {
                 .into_iter()
                 .next()
                 .context("No remote is available to push to")?;
-            let options = (!has_upstream).then_some(git::repository::PushOptions::SetUpstream);
+            let options = submit_push_options(force, has_upstream);
             repository
                 .update(cx, |repository, cx| {
                     repository.push(
@@ -485,6 +499,7 @@ impl Smartlog {
         if branches.is_empty() {
             return;
         }
+        let force = self.sidebar.force_submit;
         let mut askpass_delegates: Vec<_> = branches
             .iter()
             .map(|_| self.askpass_delegate("git push", window, cx))
@@ -506,7 +521,7 @@ impl Smartlog {
                             && candidate.upstream.is_some()
                     })
                 });
-                let options = (!has_upstream).then_some(git::repository::PushOptions::SetUpstream);
+                let options = submit_push_options(force, has_upstream);
                 repository
                     .update(cx, |repository, cx| {
                         repository.push(
@@ -1039,6 +1054,24 @@ impl Smartlog {
                 .child(primary_button)
                 .when(show_submit, |this| {
                     this.child(
+                        Checkbox::new(
+                            "smartlog-sidebar-force-submit",
+                            if self.sidebar.force_submit {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .label("Force")
+                        .tooltip(Tooltip::text(
+                            "Force push with --force-with-lease, which refuses if the remote branch has commits you haven't fetched",
+                        ))
+                        .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                            this.sidebar.force_submit = *state == ToggleState::Selected;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
                         Button::new(
                             "smartlog-sidebar-submit",
                             submit_label(commit_mode, anything_to_commit, primary),
@@ -1333,6 +1366,18 @@ mod tests {
             primary_action(false, false, true, true),
             PrimaryAction::AmendMessage
         );
+    }
+
+    #[test]
+    fn a_forced_submit_pushes_with_force_and_otherwise_sets_the_upstream_when_missing() {
+        use git::repository::PushOptions;
+        assert_eq!(submit_push_options(true, true), Some(PushOptions::Force));
+        assert_eq!(submit_push_options(true, false), Some(PushOptions::Force));
+        assert_eq!(
+            submit_push_options(false, false),
+            Some(PushOptions::SetUpstream)
+        );
+        assert_eq!(submit_push_options(false, true), None);
     }
 
     #[test]

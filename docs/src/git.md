@@ -140,7 +140,7 @@ Right-click a commit, or select several, for these actions:
 
 ### Commit Info {#smartlog-commit-info}
 
-The sidebar shows the selected commit, or the checked-out one when nothing is selected. Edit the title and description and choose Amend Message to rewrite them, which also works for commits that are not checked out. For the checked-out commit you can switch between amending it and writing a new commit, and Submit pushes its branch to the default remote.
+The sidebar shows the selected commit, or the checked-out one when nothing is selected. Edit the title and description and choose Amend Message to rewrite them, which also works for commits that are not checked out. For the checked-out commit you can switch between amending it and writing a new commit, and Submit pushes its branch to the default remote. Tick Force next to it to push with `--force-with-lease`, which refuses if the remote branch has commits you haven't fetched. Submit Stack follows the same setting.
 
 ### Smartlog Settings {#smartlog-settings}
 
