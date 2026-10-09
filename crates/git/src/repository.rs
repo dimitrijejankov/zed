@@ -57,6 +57,30 @@ static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 /// %H - Full commit hash
 static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 
+/// A change in the working tree that could be folded into an earlier commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbsorbHunk {
+    pub path: RepoPath,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_lines: u32,
+}
+
+/// The hunks that belong in one commit of the stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbsorbAssignment {
+    pub commit: String,
+    pub hunks: Vec<AbsorbHunk>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AbsorbPlan {
+    pub assignments: Vec<AbsorbAssignment>,
+    /// Hunks that touch lines from more than one commit, from outside the stack, or that are
+    /// new lines with no single neighbouring commit. They stay as uncommitted changes.
+    pub unassigned: Vec<AbsorbHunk>,
+}
+
 /// One commit of an edited stack: the original commits whose changes it combines, in the order
 /// they are applied, and the message it gets instead of the first one's.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1210,6 +1234,10 @@ pub trait GitRepository: Send + Sync {
         first_message: String,
         second_message: String,
     ) -> BoxFuture<'_, Result<String>>;
+
+    /// Works out which commit of `base..HEAD` last touched the lines each uncommitted change
+    /// edits. With `apply`, folds every change that has a single such commit into it.
+    fn absorb(&self, base: String, apply: bool) -> BoxFuture<'_, Result<AbsorbPlan>>;
 
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
@@ -3050,6 +3078,16 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn absorb(&self, base: String, apply: bool) -> BoxFuture<'_, Result<AbsorbPlan>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let mut git = git?;
+                absorb_with_git(&mut git, &base, apply).await
+            })
+            .boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -4532,19 +4570,266 @@ async fn split_commit_with_git(
     Ok(second)
 }
 
-async fn edit_stack_with_git(
+struct DiffHunk {
+    old_start: u32,
+    old_lines: u32,
+    new_lines: u32,
+    text: String,
+}
+
+struct DiffFile {
+    path: String,
+    header: String,
+    hunks: Vec<DiffHunk>,
+}
+
+fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(' ')?;
+    let new = rest.strip_prefix('+')?.split_once(' ')?.0;
+    let parse = |range: &str| -> Option<(u32, u32)> {
+        match range.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((range.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_lines) = parse(old)?;
+    let (_, new_lines) = parse(new)?;
+    Some((old_start, old_lines, new_lines))
+}
+
+/// Splits a `git diff -U0` into its files and hunks. Files that were created, deleted, renamed,
+/// are binary or have an unusual mode, or whose names git had to quote, are left out because a
+/// hunk can't be assigned to a commit for them.
+fn parse_zero_context_diff(diff: &str) -> Vec<DiffFile> {
+    let mut files: Vec<DiffFile> = Vec::new();
+    let mut skipping = false;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            skipping = false;
+            files.push(DiffFile {
+                path: String::new(),
+                header: line.to_string(),
+                hunks: Vec::new(),
+            });
+            continue;
+        }
+        let Some(file) = files.last_mut() else {
+            continue;
+        };
+        if skipping {
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            if let Some((old_start, old_lines, new_lines)) = parse_hunk_header(line) {
+                file.hunks.push(DiffHunk {
+                    old_start,
+                    old_lines,
+                    new_lines,
+                    text: line.to_string(),
+                });
+            }
+        } else if let Some(hunk) = file.hunks.last_mut() {
+            hunk.text.push_str(line);
+        } else {
+            let unsupported = line.starts_with("new file mode")
+                || line.starts_with("deleted file mode")
+                || line.starts_with("old mode")
+                || line.starts_with("new mode")
+                || line.starts_with("rename ")
+                || line.starts_with("copy ")
+                || line.starts_with("Binary files")
+                || line.starts_with("GIT binary patch");
+            if unsupported {
+                file.hunks.clear();
+                file.path.clear();
+                skipping = true;
+                continue;
+            }
+            file.header.push_str(line);
+            if let Some(path) = line.strip_prefix("+++ b/") {
+                file.path = path.trim_end_matches('\n').to_string();
+            }
+        }
+    }
+    files.retain(|file| {
+        !file.path.is_empty() && !file.path.starts_with('"') && !file.hunks.is_empty()
+    });
+    files
+}
+
+/// The commits that last touched `count` lines of `path` starting at `start`, as of `HEAD`.
+async fn blame_commits(
     git: &GitBinary,
-    base: &str,
-    tip: &str,
-    steps: &[StackStep],
-) -> Result<String> {
+    path: &str,
+    start: u32,
+    count: u32,
+) -> Result<HashSet<String>> {
+    let range = format!("{start},{}", start + count - 1);
+    let output = git
+        .run(&["blame", "--porcelain", "-L", &range, "HEAD", "--", path])
+        .await?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next()?;
+            let is_object_id = (sha.len() == 40 || sha.len() == 64)
+                && sha.chars().all(|character| character.is_ascii_hexdigit());
+            let is_group_header = fields.next()?.parse::<u32>().is_ok();
+            (is_object_id && is_group_header).then(|| sha.to_string())
+        })
+        .collect())
+}
+
+async fn absorb_with_git(git: &mut GitBinary, base: &str, apply: bool) -> Result<AbsorbPlan> {
+    let head = git.run(&["rev-parse", "--verify", "HEAD^{commit}"]).await?;
     let base = git
         .run(&["rev-parse", "--verify", &format!("{base}^{{commit}}")])
         .await?;
-    let tip = git
-        .run(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")])
-        .await?;
+    let chain = straight_chain(git, &base, &head).await?;
 
+    let diff = git
+        .run_raw(&[
+            "diff",
+            "HEAD",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+        ])
+        .await?;
+    let files = parse_zero_context_diff(&diff);
+
+    let mut plan = AbsorbPlan::default();
+    // (commit, file index, hunk index) for every hunk that has a single commit to go to.
+    let mut placements: Vec<(String, usize, usize)> = Vec::new();
+    for (file_index, file) in files.iter().enumerate() {
+        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+            let summary = AbsorbHunk {
+                path: RepoPath::new(&file.path)?,
+                old_start: hunk.old_start,
+                old_lines: hunk.old_lines,
+                new_lines: hunk.new_lines,
+            };
+            let commit = if hunk.old_lines > 0 {
+                let commits = blame_commits(git, &file.path, hunk.old_start, hunk.old_lines)
+                    .await
+                    .ok();
+                commits.and_then(|commits| single(commits))
+            } else if hunk.old_start >= 1 {
+                let before = blame_commits(git, &file.path, hunk.old_start, 1).await.ok();
+                let after = blame_commits(git, &file.path, hunk.old_start + 1, 1)
+                    .await
+                    .ok();
+                match (before.and_then(single), after.and_then(single)) {
+                    (Some(before), Some(after)) if before == after => Some(before),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match commit.filter(|commit| chain.contains(commit)) {
+                Some(commit) => {
+                    placements.push((commit.clone(), file_index, hunk_index));
+                    match plan
+                        .assignments
+                        .iter_mut()
+                        .find(|assignment| assignment.commit == commit)
+                    {
+                        Some(assignment) => assignment.hunks.push(summary),
+                        None => plan.assignments.push(AbsorbAssignment {
+                            commit,
+                            hunks: vec![summary],
+                        }),
+                    }
+                }
+                None => plan.unassigned.push(summary),
+            }
+        }
+    }
+    plan.assignments.sort_by_key(|assignment| {
+        chain
+            .iter()
+            .position(|commit| *commit == assignment.commit)
+            .unwrap_or(usize::MAX)
+    });
+    if !apply || placements.is_empty() {
+        return Ok(plan);
+    }
+
+    let mut patch_trees: HashMap<String, String> = HashMap::default();
+    for assignment in &plan.assignments {
+        let mut patch = String::new();
+        for (file_index, file) in files.iter().enumerate() {
+            let hunks: Vec<&DiffHunk> = placements
+                .iter()
+                .filter(|(commit, placed_file, _)| {
+                    *commit == assignment.commit && *placed_file == file_index
+                })
+                .filter_map(|(_, _, hunk_index)| file.hunks.get(*hunk_index))
+                .collect();
+            if hunks.is_empty() {
+                continue;
+            }
+            patch.push_str(&file.header);
+            for hunk in hunks {
+                patch.push_str(&hunk.text);
+            }
+        }
+        let patch_path = git
+            .git_directory
+            .join(format!("absorb-{}.patch", Uuid::new_v4()));
+        smol::fs::write(&patch_path, patch).await?;
+        let patch_argument = patch_path.to_string_lossy().to_string();
+        let tree = git
+            .with_temp_index(async |git| {
+                git.run(&["read-tree", "HEAD"]).await?;
+                git.run(&[
+                    "apply",
+                    "--cached",
+                    "--unidiff-zero",
+                    "--recount",
+                    &patch_argument,
+                ])
+                .await?;
+                git.run(&["write-tree"]).await
+            })
+            .await;
+        smol::fs::remove_file(&patch_path).await.log_err();
+        patch_trees.insert(assignment.commit.clone(), tree?);
+    }
+
+    let mut cursor = base.clone();
+    let mut rewritten: HashMap<String, String> = HashMap::default();
+    for commit in &chain {
+        let old_parent = git.run(&["rev-parse", &format!("{commit}^")]).await?;
+        let mut tree = merge_trees(git, &old_parent, &cursor, commit).await?;
+        if let Some(patch_tree) = patch_trees.get(commit) {
+            tree = merge_trees(git, &head, &tree, patch_tree).await?;
+        }
+        cursor = commit_tree_like(git, commit, &tree, &[cursor.as_str()], None).await?;
+        rewritten.insert(commit.clone(), cursor.clone());
+    }
+    replay_descendants(
+        git,
+        &head,
+        rewritten,
+        "No local branch or detached HEAD contains these commits, so changes can't be absorbed",
+    )
+    .await?;
+    Ok(plan)
+}
+
+fn single(commits: HashSet<String>) -> Option<String> {
+    let mut commits = commits.into_iter();
+    let commit = commits.next()?;
+    commits.next().is_none().then_some(commit)
+}
+
+/// The commits of `base..tip`, oldest first, when they form one straight line with no merges.
+async fn straight_chain(git: &GitBinary, base: &str, tip: &str) -> Result<Vec<String>> {
     let listing = git
         .run(&[
             "rev-list",
@@ -4555,7 +4840,7 @@ async fn edit_stack_with_git(
         ])
         .await?;
     let mut chain: Vec<String> = Vec::new();
-    let mut previous = base.clone();
+    let mut previous = base.to_string();
     for line in listing.lines() {
         let mut fields = line.split_whitespace();
         let Some(commit) = fields.next() else {
@@ -4570,6 +4855,23 @@ async fn edit_stack_with_git(
         previous = commit.to_string();
     }
     anyhow::ensure!(!chain.is_empty(), "There are no commits to edit");
+    Ok(chain)
+}
+
+async fn edit_stack_with_git(
+    git: &GitBinary,
+    base: &str,
+    tip: &str,
+    steps: &[StackStep],
+) -> Result<String> {
+    let base = git
+        .run(&["rev-parse", "--verify", &format!("{base}^{{commit}}")])
+        .await?;
+    let tip = git
+        .run(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")])
+        .await?;
+
+    let chain = straight_chain(git, &base, &tip).await?;
 
     let mut used: HashSet<&str> = HashSet::default();
     for source in steps.iter().flat_map(|step| step.sources.iter()) {
@@ -8707,6 +9009,126 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["rev-parse", "main"]),
             before
+        );
+    }
+
+    #[test]
+    fn test_parse_zero_context_diff_reads_files_and_hunks() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\nindex 111..222 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3 +3 @@ fn main\n-old\n+new\n@@ -10,0 +11,2 @@\n+x\n+y\ndiff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 000..111\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\ndiff --git a/bin b/bin\nindex 1..2 100644\nBinary files a/bin and b/bin differ\n";
+        let files = parse_zero_context_diff(diff);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/a.rs");
+        assert!(files[0].header.contains("+++ b/src/a.rs"));
+        assert_eq!(files[0].hunks.len(), 2);
+        assert_eq!(
+            (
+                files[0].hunks[0].old_start,
+                files[0].hunks[0].old_lines,
+                files[0].hunks[0].new_lines
+            ),
+            (3, 1, 1)
+        );
+        assert_eq!(
+            (
+                files[0].hunks[1].old_start,
+                files[0].hunks[1].old_lines,
+                files[0].hunks[1].new_lines
+            ),
+            (10, 0, 2)
+        );
+        assert!(files[0].hunks[1].text.ends_with("+x\n+y\n"));
+    }
+
+    fn write_lines(directory: &Path, file: &str, lines: &[&str]) {
+        fs::write(directory.join(file), lines.join("\n") + "\n").unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_absorb_folds_each_change_into_the_commit_that_last_touched_its_lines(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let lines: Vec<String> = (1..=10).map(|number| format!("line {number}")).collect();
+        let mut current: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_lines(repo_dir.path(), "f.txt", &current);
+        git_command(repo_dir.path(), ["add", "f.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let base = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        current[1] = "first commit's line";
+        write_lines(repo_dir.path(), "f.txt", &current);
+        git_command(repo_dir.path(), ["commit", "-am", "first"]);
+        current[7] = "second commit's line";
+        write_lines(repo_dir.path(), "f.txt", &current);
+        git_command(repo_dir.path(), ["commit", "-am", "second"]);
+
+        current[1] = "edited, belongs to first";
+        current[7] = "edited, belongs to second";
+        current[4] = "edited, belongs to base";
+        write_lines(repo_dir.path(), "f.txt", &current);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let plan = repository.absorb(base.clone(), true).await.unwrap();
+
+        assert_eq!(plan.assignments.len(), 2);
+        assert_eq!(plan.unassigned.len(), 1);
+        assert_eq!(plan.unassigned[0].old_start, 5);
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3"]),
+            "second\nfirst\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", "HEAD~1:f.txt"]),
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| match index {
+                    1 => "edited, belongs to first".to_string(),
+                    _ => line.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let committed = git_command_output(repo_dir.path(), ["show", "HEAD:f.txt"]);
+        assert!(committed.contains("edited, belongs to first"));
+        assert!(committed.contains("edited, belongs to second"));
+        assert!(!committed.contains("belongs to base"));
+
+        let remaining = git_command_output(repo_dir.path(), ["diff", "HEAD", "-U0"]);
+        assert!(remaining.contains("belongs to base"));
+        assert!(!remaining.contains("belongs to first"));
+        assert!(!remaining.contains("belongs to second"));
+    }
+
+    #[gpui::test]
+    async fn test_absorb_without_apply_only_reports_the_plan(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        write_lines(repo_dir.path(), "f.txt", &["a", "b", "c"]);
+        git_command(repo_dir.path(), ["add", "f.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+        let base = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        write_lines(repo_dir.path(), "f.txt", &["a", "changed", "c"]);
+        git_command(repo_dir.path(), ["commit", "-am", "change b"]);
+        let head = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+        write_lines(repo_dir.path(), "f.txt", &["a", "changed again", "c"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let plan = repository.absorb(base, false).await.unwrap();
+
+        assert_eq!(plan.assignments.len(), 1);
+        assert_eq!(plan.assignments[0].commit, head);
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
+            head
         );
     }
 }

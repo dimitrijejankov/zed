@@ -1810,6 +1810,14 @@ impl GitRepository for FakeGitRepository {
         async { anyhow::bail!("splitting commits is not supported by the fake repository") }.boxed()
     }
 
+    fn absorb(
+        &self,
+        _base: String,
+        _apply: bool,
+    ) -> BoxFuture<'_, Result<git::repository::AbsorbPlan>> {
+        async { Ok(git::repository::AbsorbPlan::default()) }.boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

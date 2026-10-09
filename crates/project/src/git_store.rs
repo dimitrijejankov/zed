@@ -38,12 +38,13 @@ use git::{
     blame::Blame,
     parse_git_remote_url,
     repository::{
-        Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
-        CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, HIDDEN_COMMIT_REF_PREFIX,
-        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-        RepoPath, ResetMode, SearchCommitArgs, StackStep, UpstreamTrackingStatus,
-        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        AbsorbAssignment, AbsorbHunk, AbsorbPlan, Branch, BranchesScanResult, CommitData,
+        CommitDetails, CommitFileStatus, CommitOptions, CreateWorktreeTarget, DiffStatType,
+        DiffType, FetchOptions, FileHistoryChangedFileSets, GitCommitTemplate, GitRepository,
+        GitRepositoryCheckpoint, HIDDEN_COMMIT_REF_PREFIX, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        StackStep, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
+        is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -1109,6 +1110,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_amend_to);
         client.add_entity_request_handler(Self::handle_edit_stack);
         client.add_entity_request_handler(Self::handle_split_commit);
+        client.add_entity_request_handler(Self::handle_absorb);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4284,6 +4286,24 @@ impl GitStore {
             .await??;
 
         Ok(proto::GitCommitBeforeTimeResponse { sha })
+    }
+
+    async fn handle_absorb(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitAbsorb>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitAbsorbResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let payload = envelope.payload;
+
+        let plan = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.absorb(payload.base, payload.apply)
+            })
+            .await??;
+
+        Ok(absorb_plan_to_proto(&plan))
     }
 
     async fn handle_split_commit(
@@ -9886,6 +9906,34 @@ impl Repository {
         receiver
     }
 
+    /// Works out which commit of `base..HEAD` each uncommitted change belongs in, and with
+    /// `apply` folds them in.
+    pub fn absorb(&mut self, base: String, apply: bool) -> oneshot::Receiver<Result<AbsorbPlan>> {
+        let id = self.id;
+        self.send_job(
+            "absorb",
+            apply.then(|| "git absorb".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.absorb(base, apply).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let response = client
+                            .request(proto::GitAbsorb {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                base,
+                                apply,
+                            })
+                            .await?;
+                        absorb_plan_from_proto(response)
+                    }
+                }
+            },
+        )
+    }
+
     /// Splits `sha` in two: the first commit gets only the changes to `first_paths`.
     pub fn split_commit(
         &mut self,
@@ -11753,6 +11801,62 @@ fn deserialize_blame_buffer_response(
     ))
 }
 
+fn absorb_hunk_to_proto(hunk: &AbsorbHunk) -> proto::GitAbsorbHunk {
+    proto::GitAbsorbHunk {
+        path: hunk.path.as_unix_str().to_owned(),
+        old_start: hunk.old_start,
+        old_lines: hunk.old_lines,
+        new_lines: hunk.new_lines,
+    }
+}
+
+fn absorb_hunk_from_proto(hunk: proto::GitAbsorbHunk) -> Result<AbsorbHunk> {
+    Ok(AbsorbHunk {
+        path: RepoPath::from_proto(&hunk.path)?,
+        old_start: hunk.old_start,
+        old_lines: hunk.old_lines,
+        new_lines: hunk.new_lines,
+    })
+}
+
+fn absorb_plan_to_proto(plan: &AbsorbPlan) -> proto::GitAbsorbResponse {
+    proto::GitAbsorbResponse {
+        assignments: plan
+            .assignments
+            .iter()
+            .map(|assignment| proto::GitAbsorbAssignment {
+                commit: assignment.commit.clone(),
+                hunks: assignment.hunks.iter().map(absorb_hunk_to_proto).collect(),
+            })
+            .collect(),
+        unassigned: plan.unassigned.iter().map(absorb_hunk_to_proto).collect(),
+    }
+}
+
+fn absorb_plan_from_proto(response: proto::GitAbsorbResponse) -> Result<AbsorbPlan> {
+    Ok(AbsorbPlan {
+        assignments: response
+            .assignments
+            .into_iter()
+            .map(|assignment| {
+                Ok(AbsorbAssignment {
+                    commit: assignment.commit,
+                    hunks: assignment
+                        .hunks
+                        .into_iter()
+                        .map(absorb_hunk_from_proto)
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect::<Result<_>>()?,
+        unassigned: response
+            .unassigned
+            .into_iter()
+            .map(absorb_hunk_from_proto)
+            .collect::<Result<_>>()?,
+    })
+}
+
 fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
     proto::GitLogSource {
         source: Some(match log_source {
@@ -12040,6 +12144,26 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_absorb_plan_survives_the_trip_through_proto() {
+        let hunk = |path: &str, start: u32| AbsorbHunk {
+            path: RepoPath::new(path).unwrap(),
+            old_start: start,
+            old_lines: 2,
+            new_lines: 3,
+        };
+        let plan = AbsorbPlan {
+            assignments: vec![AbsorbAssignment {
+                commit: "abc".to_string(),
+                hunks: vec![hunk("src/a.rs", 4), hunk("b.txt", 9)],
+            }],
+            unassigned: vec![hunk("c.txt", 1)],
+        };
+
+        let round_tripped = absorb_plan_from_proto(absorb_plan_to_proto(&plan)).unwrap();
+        assert_eq!(round_tripped, plan);
+    }
+
     use super::*;
     use crate::Project;
     use fs::{FakeBlobReadGate, FakeFs, Fs};

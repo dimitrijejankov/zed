@@ -48,6 +48,7 @@ use git::repository::RepoPath;
 use git_ui_core::askpass_modal::AskPassModal;
 use workspace::{Toast, notifications::NotificationId};
 
+mod absorb;
 mod bookmarks;
 mod edit_stack;
 mod persistence;
@@ -2501,6 +2502,53 @@ impl Smartlog {
         self.run_logged("Failed to edit the stack", task, window, cx);
     }
 
+    /// The commit the stack containing `HEAD` is based on, which is where absorbing starts.
+    fn head_stack_base(&self) -> Option<Oid> {
+        let mut root = self.head?;
+        if !self.parents.contains_key(&root) {
+            return None;
+        }
+        while let Some(parent) = self.parents.get(&root).copied().flatten()
+            && self.parents.contains_key(&parent)
+        {
+            root = parent;
+        }
+        self.parents.get(&root).copied().flatten()
+    }
+
+    fn open_absorb(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(base) = self.head_stack_base() else {
+            return;
+        };
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let smartlog = cx.weak_entity();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| {
+                    absorb::AbsorbModal::new(smartlog, repository, base, cx)
+                });
+            })
+            .log_err();
+    }
+
+    fn apply_absorb(&mut self, base: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let task = cx.spawn_in(window, async move |this, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.absorb(base.to_string(), true)
+                })
+                .await??;
+            this.update_in(cx, |this, window, cx| this.refresh(window, cx))?;
+            anyhow::Ok(())
+        });
+        self.run_logged("Failed to absorb changes", task, window, cx);
+    }
+
     fn apply_split(
         &mut self,
         sha: Oid,
@@ -3403,6 +3451,19 @@ impl Smartlog {
                     .size(ButtonSize::Compact)
                     .disabled(nothing_selected)
                     .on_click(cx.listener(|this, _, _, cx| this.deselect_all(cx))),
+            )
+            .child(
+                Button::new("smartlog-absorb", "Absorb")
+                    .start_icon(Icon::new(IconName::ArrowDown).size(IconSize::Small))
+                    .style(ButtonStyle::Subtle)
+                    .size(ButtonSize::Compact)
+                    .disabled(self.head_stack_base().is_none())
+                    .tooltip(Tooltip::text(
+                        "Fold each change into the commit of this stack that last touched its lines",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_absorb(window, cx);
+                    })),
             )
             .child(
                 Button::new("smartlog-discard", "Discard")
@@ -5262,6 +5323,9 @@ mod tests {
                 edit_stack::EditStackModal::new(smartlog_handle, stack_base, tip, entries, cx)
             });
         });
+        draw(cx);
+
+        smartlog.update_in(cx, |smartlog, window, cx| smartlog.open_absorb(window, cx));
         draw(cx);
 
         let split_smartlog = smartlog.downgrade();

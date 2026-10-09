@@ -535,7 +535,9 @@ message Envelope {
     GitCommitBeforeTimeResponse git_commit_before_time_response = 503;
     GitAmendTo git_amend_to = 504;
     GitEditStack git_edit_stack = 505;
-    GitSplitCommit git_split_commit = 506; // current max
+    GitSplitCommit git_split_commit = 506;
+    GitAbsorb git_absorb = 507;
+    GitAbsorbResponse git_absorb_response = 508; // current max
   }
 
   reserved 87 to 88;

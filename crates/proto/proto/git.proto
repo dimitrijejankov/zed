@@ -697,6 +697,30 @@ message GitAmendTo {
   string sha = 3;
 }
 
+message GitAbsorb {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string base = 3;
+  bool apply = 4;
+}
+
+message GitAbsorbHunk {
+  string path = 1;
+  uint32 old_start = 2;
+  uint32 old_lines = 3;
+  uint32 new_lines = 4;
+}
+
+message GitAbsorbAssignment {
+  string commit = 1;
+  repeated GitAbsorbHunk hunks = 2;
+}
+
+message GitAbsorbResponse {
+  repeated GitAbsorbAssignment assignments = 1;
+  repeated GitAbsorbHunk unassigned = 2;
+}
+
 message GitSplitCommit {
   uint64 project_id = 1;
   uint64 repository_id = 2;
