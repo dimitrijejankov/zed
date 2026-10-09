@@ -918,6 +918,21 @@ impl Smartlog {
             .justify_end()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
+            .child({
+                let can_fold = fold_chain(&self.parents, &self.selection).is_some();
+                Button::new("smartlog-fold", "Fold")
+                    .start_icon(Icon::new(IconName::FoldVertical).size(IconSize::Small))
+                    .style(ButtonStyle::Filled)
+                    .disabled(!can_fold)
+                    .tooltip(Tooltip::text(if can_fold {
+                        "Combine the selected commits into one commit"
+                    } else {
+                        "Select an unbroken chain of commits, with nothing else built on its middle, to fold them"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.fold_selection(window, cx);
+                    }))
+            })
             .child(
                 Button::new("smartlog-clear-selection", "Deselect All")
                     .style(ButtonStyle::Subtle)

@@ -519,6 +519,40 @@ fn apply_click(
     (only_clicked, Some(clicked))
 }
 
+/// Orders `selected` oldest first when it forms one unbroken chain of at least two commits,
+/// each the only parent of the next, which is what folding needs.
+fn fold_chain(parents: &HashMap<Oid, Option<Oid>>, selected: &HashSet<Oid>) -> Option<Vec<Oid>> {
+    if selected.len() < 2 {
+        return None;
+    }
+    let mut roots = selected.iter().copied().filter(|sha| {
+        !parents
+            .get(sha)
+            .copied()
+            .flatten()
+            .is_some_and(|parent| selected.contains(&parent))
+    });
+    let oldest = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+
+    let mut chain = vec![oldest];
+    while chain.len() < selected.len() {
+        let last = *chain.last()?;
+        let mut next = selected
+            .iter()
+            .copied()
+            .filter(|sha| parents.get(sha).copied().flatten() == Some(last));
+        let following = next.next()?;
+        if next.next().is_some() {
+            return None;
+        }
+        chain.push(following);
+    }
+    Some(chain)
+}
+
 /// `head` together with every commit below it that is one of the listed drafts.
 fn lineage_of(parents: &HashMap<Oid, Option<Oid>>, head: Option<Oid>) -> HashSet<Oid> {
     let mut lineage = HashSet::default();
@@ -839,6 +873,53 @@ impl Smartlog {
         self.selection = selection;
         self.selection_anchor = anchor;
         self.sync_sidebar(window, cx);
+    }
+
+    fn fold_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let Some(chain) = fold_chain(&self.parents, &self.selection) else {
+            return;
+        };
+        let messages: Option<Vec<String>> = chain
+            .iter()
+            .map(|sha| {
+                self.commits
+                    .get(sha)
+                    .map(|commit| commit.message.trim().to_string())
+            })
+            .collect();
+        let Some(messages) = messages else {
+            return;
+        };
+        let message = messages.join("\n\n");
+        let shas: Vec<String> = chain.iter().map(|sha| sha.to_string()).collect();
+        let count = chain.len();
+
+        let prompt = window.prompt(
+            PromptLevel::Warning,
+            &format!("Combine {count} commits into one?"),
+            Some("The commits are replaced by a single commit with their messages joined."),
+            &["Fold", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if prompt.await? != 0 {
+                return anyhow::Ok(());
+            }
+            let folded = repository
+                .update(cx, |repository, _| repository.fold_commits(shas, message))
+                .await??;
+            this.update_in(cx, |this, window, cx| {
+                this.selection.clear();
+                this.selection_anchor = None;
+                this.pending_selection = folded.parse::<Oid>().ok();
+                this.refresh(window, cx);
+            })?;
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to fold commits", window, cx, |_, _, _| None);
     }
 
     fn hide_commit(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
@@ -2364,6 +2445,26 @@ mod tests {
 
         assert_eq!(hidden_closure(&parents, &set(&[2]), &protected), set(&[]));
         assert_eq!(hidden_closure(&parents, &set(&[4]), &protected), set(&[4]));
+    }
+
+    #[test]
+    fn a_contiguous_selection_folds_oldest_first() {
+        let (trunk, a, b, c, d) = (oid(1), oid(2), oid(3), oid(4), oid(5));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (c, Some(b)), (d, Some(c))]);
+
+        assert_eq!(fold_chain(&parents, &set(&[4, 3, 2])), Some(vec![a, b, c]));
+        assert_eq!(fold_chain(&parents, &set(&[3, 4])), Some(vec![b, c]));
+    }
+
+    #[test]
+    fn a_broken_or_forked_selection_cannot_be_folded() {
+        let (trunk, a, b, c, d) = (oid(1), oid(2), oid(3), oid(4), oid(5));
+        let parents = parents_of(&[(a, Some(trunk)), (b, Some(a)), (c, Some(b)), (d, Some(a))]);
+
+        assert_eq!(fold_chain(&parents, &set(&[2, 4])), None);
+        assert_eq!(fold_chain(&parents, &set(&[3, 5])), None);
+        assert_eq!(fold_chain(&parents, &set(&[3])), None);
+        assert_eq!(fold_chain(&parents, &set(&[2, 3, 5])), None);
     }
 
     #[test]
