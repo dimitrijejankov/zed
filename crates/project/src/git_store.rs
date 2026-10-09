@@ -1100,6 +1100,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_worktree_created_at);
         client.add_entity_request_handler(Self::handle_get_head_sha);
         client.add_entity_request_handler(Self::handle_edit_ref);
+        client.add_entity_request_handler(Self::handle_reword_commit);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
         client.add_entity_stream_request_handler(Self::handle_get_initial_graph_data);
@@ -4253,6 +4254,25 @@ impl GitStore {
             }
             None => anyhow::bail!("GitEditRef missing action"),
         }
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_reword_commit(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRewordCommit>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let sha = envelope.payload.sha;
+        let message = envelope.payload.message;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.reword_commit(sha, message)
+            })
+            .await??;
 
         Ok(proto::Ack {})
     }
@@ -9494,6 +9514,34 @@ impl Repository {
 
     pub fn delete_ref(&mut self, ref_name: String) -> oneshot::Receiver<Result<()>> {
         self.edit_ref(ref_name, None)
+    }
+
+    /// Rewrites the message of `sha` and rebuilds the commits that descend from it, without
+    /// touching the working tree or the index.
+    pub fn reword_commit(&mut self, sha: String, message: String) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            "reword_commit",
+            Some("git commit-tree".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.reword_commit(sha, message).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitRewordCommit {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                sha,
+                                message,
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        )
     }
 
     pub fn repair_worktrees(&mut self) -> oneshot::Receiver<Result<()>> {

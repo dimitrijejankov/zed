@@ -1146,6 +1146,11 @@ pub trait GitRepository: Send + Sync {
 
     fn delete_ref(&self, ref_name: String) -> BoxFuture<'_, Result<()>>;
 
+    /// Rewrites the message of `sha` and recreates all of its descendants on top of the new
+    /// commit, then moves the local branches (and a detached `HEAD`) that pointed at the old
+    /// commits. Commit trees are unchanged, so the working tree and index are left alone.
+    fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<()>>;
+
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
 
     fn set_trusted(&self, trusted: bool);
@@ -2835,6 +2840,13 @@ impl GitRepository for RealGitRepository {
         self.edit_ref(RefEdit::Delete { ref_name })
     }
 
+    fn reword_commit(&self, sha: String, message: String) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move { reword_commit_with_git(&git, &sha, &message).await })
+            .boxed()
+    }
+
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary();
         self.executor
@@ -4053,6 +4065,174 @@ impl GitBinary {
         command.envs(&self.envs);
         command
     }
+}
+
+async fn reword_commit_with_git(git: &GitBinary, sha: &str, message: &str) -> Result<()> {
+    let target = git
+        .run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+        .await?;
+
+    let descendants = git
+        .run(&[
+            "rev-list",
+            "--topo-order",
+            "--reverse",
+            "--parents",
+            "--ancestry-path",
+            &format!("^{target}"),
+            "--branches",
+            "HEAD",
+            "--",
+        ])
+        .await?;
+
+    let mut rewritten: HashMap<String, String> = HashMap::default();
+
+    let target_parents = git
+        .run(&["rev-list", "--parents", "-n", "1", &target])
+        .await?;
+    let target_parents: Vec<&str> = target_parents.split_whitespace().skip(1).collect();
+    let new_target =
+        recreate_commit(git, &target, &target_parents, &rewritten, Some(message)).await?;
+    rewritten.insert(target, new_target);
+
+    for line in descendants.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(commit) = fields.next() else {
+            continue;
+        };
+        let parents: Vec<&str> = fields.collect();
+        let new_commit = recreate_commit(git, commit, &parents, &rewritten, None).await?;
+        rewritten.insert(commit.to_string(), new_commit);
+    }
+
+    let mut moved_refs = 0;
+    let branches = git
+        .run(&[
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            "refs/heads",
+        ])
+        .await?;
+    for line in branches.lines() {
+        let Some((ref_name, object)) = line.split_once('\0') else {
+            continue;
+        };
+        if let Some(new_object) = rewritten.get(object) {
+            git.run(&[
+                "update-ref",
+                "-m",
+                "reword commit",
+                ref_name,
+                new_object,
+                object,
+            ])
+            .await?;
+            moved_refs += 1;
+        }
+    }
+
+    if git.run(&["symbolic-ref", "--quiet", "HEAD"]).await.is_err() {
+        let head = git.run(&["rev-parse", "HEAD"]).await?;
+        if let Some(new_head) = rewritten.get(&head) {
+            git.run(&[
+                "update-ref",
+                "--no-deref",
+                "-m",
+                "reword commit",
+                "HEAD",
+                new_head,
+                &head,
+            ])
+            .await?;
+            moved_refs += 1;
+        }
+    }
+
+    anyhow::ensure!(
+        moved_refs > 0,
+        "No local branch or detached HEAD contains this commit, so it can't be reworded"
+    );
+    Ok(())
+}
+
+/// Creates a copy of `commit` with the same tree, author and committer, whose parents are the
+/// `parents` mapped through `rewritten`. The message is kept unless `message` is given.
+async fn recreate_commit(
+    git: &GitBinary,
+    commit: &str,
+    parents: &[&str],
+    rewritten: &HashMap<String, String>,
+    message: Option<&str>,
+) -> Result<String> {
+    let metadata = git
+        .run(&[
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B",
+            commit,
+        ])
+        .await?;
+    let mut fields = metadata.splitn(7, '\0');
+    let (
+        Some(author_name),
+        Some(author_email),
+        Some(author_date),
+        Some(committer_name),
+        Some(committer_email),
+        Some(committer_date),
+        Some(original_message),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        anyhow::bail!("Could not read the metadata of commit {commit}");
+    };
+
+    let tree = git
+        .run(&["rev-parse", &format!("{commit}^{{tree}}")])
+        .await?;
+    let message = message.unwrap_or(original_message).trim_end_matches('\n');
+
+    let mut arguments: Vec<String> = vec!["commit-tree".into(), tree];
+    for parent in parents {
+        arguments.push("-p".into());
+        arguments.push(
+            rewritten
+                .get(*parent)
+                .cloned()
+                .unwrap_or_else(|| parent.to_string()),
+        );
+    }
+    arguments.push("-m".into());
+    arguments.push(message.to_string());
+
+    let environment: HashMap<String, String> = HashMap::from_iter([
+        ("GIT_AUTHOR_NAME".to_string(), author_name.to_string()),
+        ("GIT_AUTHOR_EMAIL".to_string(), author_email.to_string()),
+        ("GIT_AUTHOR_DATE".to_string(), author_date.to_string()),
+        ("GIT_COMMITTER_NAME".to_string(), committer_name.to_string()),
+        (
+            "GIT_COMMITTER_EMAIL".to_string(),
+            committer_email.to_string(),
+        ),
+        ("GIT_COMMITTER_DATE".to_string(), committer_date.to_string()),
+    ]);
+    let mut command = git.build_command(&arguments);
+    command.envs(&environment);
+    let output = command.output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git commit-tree failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 #[derive(Error, Debug)]
@@ -7054,6 +7234,199 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+
+    fn commit_file(directory: &Path, file: &str, contents: &str, message: &str) -> String {
+        fs::write(directory.join(file), contents).unwrap();
+        git_command(directory, ["add", file]);
+        git_command(
+            directory,
+            [
+                "commit",
+                "-m",
+                message,
+                "--date",
+                "2020-01-02T03:04:05+00:00",
+            ],
+        );
+        git_command_output(directory, ["rev-parse", "HEAD"])
+    }
+
+    fn open_repository(directory: &Path, cx: &TestAppContext) -> RealGitRepository {
+        RealGitRepository::new(
+            &directory.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap()
+    }
+
+    fn commit_message(directory: &Path, revision: &str) -> String {
+        git_command_output(directory, ["show", "-s", "--format=%B", revision])
+    }
+
+    #[gpui::test]
+    async fn test_reword_commit_rewrites_descendants_on_a_branch(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        let middle = commit_file(repo_dir.path(), "b.txt", "b", "middle");
+        let tip = commit_file(repo_dir.path(), "c.txt", "c", "tip");
+        let tip_tree = git_command_output(repo_dir.path(), ["rev-parse", "HEAD^{tree}"]);
+        fs::write(repo_dir.path().join("untracked.txt"), "keep me").unwrap();
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .reword_commit(middle.clone(), "renamed middle\n\nwith a body".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            commit_message(repo_dir.path(), "HEAD~1"),
+            "renamed middle\n\nwith a body"
+        );
+        assert_eq!(commit_message(repo_dir.path(), "HEAD"), "tip");
+        assert_eq!(commit_message(repo_dir.path(), "HEAD~2"), "base");
+        assert_ne!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
+            tip
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD^{tree}"]),
+            tip_tree
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "-1", "--format=%aI", "HEAD"]),
+            "2020-01-02T03:04:05Z"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["status", "--porcelain"]),
+            "?? untracked.txt"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reword_commit_moves_every_branch_that_contains_it(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        let shared = commit_file(repo_dir.path(), "b.txt", "b", "shared");
+        commit_file(repo_dir.path(), "c.txt", "c", "main only");
+        git_command(repo_dir.path(), ["switch", "-c", "other", &shared]);
+        commit_file(repo_dir.path(), "d.txt", "d", "other only");
+        git_command(repo_dir.path(), ["switch", "main"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .reword_commit(shared, "shared, reworded".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            commit_message(repo_dir.path(), "main~1"),
+            "shared, reworded"
+        );
+        assert_eq!(
+            commit_message(repo_dir.path(), "other~1"),
+            "shared, reworded"
+        );
+        assert_eq!(commit_message(repo_dir.path(), "main"), "main only");
+        assert_eq!(commit_message(repo_dir.path(), "other"), "other only");
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main~1"]),
+            git_command_output(repo_dir.path(), ["rev-parse", "other~1"]),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reword_commit_preserves_merge_parents(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "a.txt", "a", "base");
+        git_command(repo_dir.path(), ["switch", "-c", "side"]);
+        commit_file(repo_dir.path(), "side.txt", "s", "side");
+        git_command(repo_dir.path(), ["switch", "main"]);
+        commit_file(repo_dir.path(), "main.txt", "m", "main");
+        git_command(repo_dir.path(), ["merge", "--no-ff", "side", "-m", "merge"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .reword_commit(base, "base, reworded".to_string())
+            .await
+            .unwrap();
+
+        let parents = git_command_output(repo_dir.path(), ["log", "-1", "--format=%P", "HEAD"]);
+        assert_eq!(parents.split_whitespace().count(), 2);
+        assert_eq!(commit_message(repo_dir.path(), "HEAD"), "merge");
+        assert_eq!(
+            git_command_output(
+                repo_dir.path(),
+                ["log", "--format=%B", "--max-parents=0", "main"]
+            ),
+            "base, reworded"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-list", "--count", "HEAD"]),
+            "4"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reword_commit_moves_a_detached_head(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        let middle = commit_file(repo_dir.path(), "b.txt", "b", "middle");
+        commit_file(repo_dir.path(), "c.txt", "c", "tip");
+        git_command(repo_dir.path(), ["checkout", "--detach"]);
+        git_command(repo_dir.path(), ["branch", "-D", "main"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .reword_commit(middle, "middle, reworded".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            commit_message(repo_dir.path(), "HEAD~1"),
+            "middle, reworded"
+        );
+        assert_eq!(commit_message(repo_dir.path(), "HEAD"), "tip");
+    }
+
+    #[gpui::test]
+    async fn test_reword_commit_fails_when_no_branch_contains_the_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "a.txt", "a", "base");
+        let orphaned = commit_file(repo_dir.path(), "b.txt", "b", "orphaned");
+        git_command(repo_dir.path(), ["reset", "--hard", "HEAD~1"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let error = repository
+            .reword_commit(orphaned, "nope".to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("can't be reworded"),
+            "unexpected error: {error}"
         );
     }
 }
