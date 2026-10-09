@@ -133,6 +133,7 @@ Right-click a commit, or select several, for these actions:
 - **Rebase** a stack onto the trunk, or drag a commit onto another commit to move it and everything built on it. If a rebase stops on conflicts, resolve them and choose Continue in the banner, or Abort.
 - **Edit Stack** reorders, drops or combines the commits of a straight stack. The commits are merged in memory, so nothing changes if the new order conflicts.
 - **Fold** combines selected commits, **Split** divides a commit by file, and **Amend Changes to Here** adds your uncommitted changes to an older commit.
+- **Submit Stack** pushes every branch in a stack to the default remote.
 - **Hide** removes a commit and everything built on it from the view without deleting it. Hidden commits can be shown again from the header.
 - **Create Bookmark** makes a branch at a commit without switching to it, and the bookmarks button lists, switches and deletes them.
 - **Download Commits** fetches a branch, tag, commit or pull request number from the default remote.
