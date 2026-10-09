@@ -59,25 +59,48 @@ impl BookmarksModal {
     }
 
     fn bookmarks(&self, cx: &App) -> Vec<Bookmark> {
-        self.repository
-            .read(cx)
-            .branch_list
+        local_bookmarks(self.repository.read(cx))
+    }
+}
+
+fn local_bookmarks(repository: &Repository) -> Vec<Bookmark> {
+    repository
+        .branch_list
+        .iter()
+        .filter(|branch| !branch.is_remote())
+        .map(|branch| Bookmark {
+            name: branch.name().to_string(),
+            subject: branch
+                .most_recent_commit
+                .as_ref()
+                .map(|commit| commit.subject.clone())
+                .unwrap_or_default(),
+            tip: branch
+                .most_recent_commit
+                .as_ref()
+                .map(|commit| commit.sha.to_string()),
+            is_head: branch.is_head,
+        })
+        .collect()
+}
+
+impl Smartlog {
+    /// The local branches already on the trunk. Hidden commits still count as unlanded work, so
+    /// branches on them are kept.
+    pub(super) fn merged_bookmark_names(&self, cx: &App) -> Vec<String> {
+        let Some(repository) = self.repository(cx) else {
+            return Vec::new();
+        };
+        let draft_shas: HashSet<String> = self
+            .all_draft_shas
             .iter()
-            .filter(|branch| !branch.is_remote())
-            .map(|branch| Bookmark {
-                name: branch.name().to_string(),
-                subject: branch
-                    .most_recent_commit
-                    .as_ref()
-                    .map(|commit| commit.subject.clone())
-                    .unwrap_or_default(),
-                tip: branch
-                    .most_recent_commit
-                    .as_ref()
-                    .map(|commit| commit.sha.to_string()),
-                is_head: branch.is_head,
-            })
-            .collect()
+            .map(|sha| sha.to_string())
+            .collect();
+        merged_bookmarks(
+            &local_bookmarks(repository.read(cx)),
+            &draft_shas,
+            &self.trunk,
+        )
     }
 }
 
@@ -95,14 +118,7 @@ impl Render for BookmarksModal {
         let bookmarks = self.bookmarks(cx);
         let merged = self
             .smartlog
-            .read_with(cx, |smartlog, _| {
-                let draft_shas: HashSet<String> = smartlog
-                    .all_draft_shas
-                    .iter()
-                    .map(|sha| sha.to_string())
-                    .collect();
-                merged_bookmarks(&bookmarks, &draft_shas, &smartlog.trunk)
-            })
+            .read_with(cx, |smartlog, cx| smartlog.merged_bookmark_names(cx))
             .unwrap_or_default();
         let merged_count = merged.len();
         let colors = cx.theme().colors().clone();

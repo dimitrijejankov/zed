@@ -27,8 +27,8 @@ use std::{
 use time::OffsetDateTime;
 use time_format::TimestampFormat;
 use ui::{
-    Checkbox, Chip, CommonAnimationExt as _, ContextMenu, Headline, HeadlineSize, IconButtonShape,
-    ToggleState, Tooltip, prelude::*,
+    Checkbox, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Headline, HeadlineSize,
+    IconButtonShape, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt;
 use workspace::{
@@ -1874,6 +1874,16 @@ impl Smartlog {
                 })
         });
 
+        self.show_context_menu(menu, position, window, cx);
+    }
+
+    fn show_context_menu(
+        &mut self,
+        menu: Entity<ContextMenu>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&menu.focus_handle(cx), cx);
         let subscription =
             cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
@@ -2119,6 +2129,126 @@ impl Smartlog {
             report_rebase_conflicts(&workspace, result, cx)
         });
         self.run_logged("Failed to amend changes to commit", task, window, cx);
+    }
+
+    /// Rebases every stack onto the trunk, one after another. Stacks that aren't checked out are
+    /// rebased by checking their branch out, so the original branch is restored in between and
+    /// the checked-out stack goes last. Stops at the first stack that needs attention.
+    fn rebase_all_stacks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        if self.rebase_in_progress(cx) {
+            return;
+        }
+        let original_branch = repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string());
+        let mut roots: Vec<Oid> = self
+            .parents
+            .iter()
+            .filter(|(_, parent)| parent.is_some_and(|parent| !self.parents.contains_key(&parent)))
+            .map(|(root, _)| *root)
+            .collect();
+        roots.sort_by_key(|root| {
+            self.layout
+                .rows
+                .iter()
+                .position(|row| row.sha == Some(*root))
+        });
+        let mut plans: Vec<RebasePlan> = roots
+            .into_iter()
+            .filter_map(|root| self.rebase_plan(root, cx))
+            .filter(|plan| plan.branch.is_none() || original_branch.is_some())
+            .collect();
+        plans.sort_by_key(|plan| plan.branch.is_none());
+        if plans.is_empty() {
+            return;
+        }
+
+        let trunk = self.trunk.to_string();
+        let workspace = self.workspace.clone();
+        let task = cx.spawn_in(window, async move |_, cx| {
+            for plan in plans {
+                let moves_other_branch = plan.branch.is_some();
+                let result = repository
+                    .update(cx, |repository, cx| {
+                        repository.rebase_onto(
+                            trunk.clone(),
+                            plan.old_base.to_string(),
+                            plan.branch,
+                            cx,
+                        )
+                    })
+                    .await?;
+                let stopped = result.as_ref().is_err_and(stopped_on_conflicts);
+                report_rebase_conflicts(&workspace, result, cx)?;
+                if stopped {
+                    return anyhow::Ok(());
+                }
+                if moves_other_branch && let Some(original_branch) = original_branch.clone() {
+                    repository
+                        .update(cx, |repository, _| {
+                            repository.change_branch(original_branch)
+                        })
+                        .await??;
+                }
+            }
+            Ok(())
+        });
+        self.run_logged("Failed to rebase all stacks", task, window, cx);
+    }
+
+    fn deploy_bulk_actions_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let smartlog = cx.entity().downgrade();
+        let focus_handle = self.focus_handle.clone();
+        let trunk = self.trunk.clone();
+        let merged = self.merged_bookmark_names(cx);
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.context(focus_handle)
+                .header("Bulk Actions")
+                .entry("Select All", None, {
+                    let smartlog = smartlog.clone();
+                    move |window, cx| {
+                        smartlog
+                            .update(cx, |this, cx| {
+                                this.select_all_commits(&SelectAllCommits, window, cx)
+                            })
+                            .log_err();
+                    }
+                })
+                .entry(format!("Rebase All onto {trunk}"), None, {
+                    let smartlog = smartlog.clone();
+                    move |window, cx| {
+                        smartlog
+                            .update(cx, |this, cx| this.rebase_all_stacks(window, cx))
+                            .log_err();
+                    }
+                })
+                .item(
+                    ContextMenuEntry::new(format!("Clean Up All ({})", merged.len()))
+                        .disabled(merged.is_empty())
+                        .handler({
+                            let smartlog = smartlog.clone();
+                            move |window, cx| {
+                                let merged = merged.clone();
+                                smartlog
+                                    .update(cx, |this, cx| {
+                                        this.delete_bookmarks(merged, window, cx)
+                                    })
+                                    .log_err();
+                            }
+                        }),
+                )
+        });
+        self.show_context_menu(menu, position, window, cx);
     }
 
     fn drag_rebase_plan(&self, source: Oid, target: Oid, cx: &App) -> Option<RebasePlan> {
@@ -3455,6 +3585,14 @@ impl Render for Smartlog {
             .child(
                 h_flex()
                     .gap_2()
+                    .child(
+                        IconButton::new("smartlog-bulk-actions", IconName::PlayFilled)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Bulk actions"))
+                            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                this.deploy_bulk_actions_menu(event.position(), window, cx);
+                            })),
+                    )
                     .child(
                         IconButton::new("smartlog-bookmarks", IconName::Bookmark)
                             .icon_size(IconSize::Small)
