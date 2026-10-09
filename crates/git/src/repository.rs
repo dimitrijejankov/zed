@@ -1178,6 +1178,10 @@ pub trait GitRepository: Send + Sync {
     /// `message`, rebuilding everything on top of them. Returns the sha of the folded commit.
     fn fold_commits(&self, shas: Vec<String>, message: String) -> BoxFuture<'_, Result<String>>;
 
+    /// Folds the staged changes into `sha`, an ancestor of `HEAD`, by committing them as a fixup
+    /// and autosquashing it. If the squash conflicts the rebase stays in progress.
+    fn amend_to(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
     /// The newest commit reachable from `rev` that was made at or before `unix_timestamp`.
@@ -2944,6 +2948,40 @@ impl GitRepository for RealGitRepository {
                     ])
                     .await?;
                 Ok((!sha.is_empty()).then_some(sha))
+            })
+            .boxed()
+    }
+
+    fn amend_to(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let git = git?;
+                let target = git
+                    .run(&["rev-parse", "--verify", &format!("{sha}^{{commit}}")])
+                    .await?;
+                let has_staged_changes = git.run(&["diff", "--cached", "--quiet"]).await.is_err();
+                anyhow::ensure!(
+                    has_staged_changes,
+                    "There are no staged changes to add to that commit"
+                );
+                git.run(&["commit", "--quiet", "--no-verify", "--fixup", &target])
+                    .await?;
+
+                let mut arguments = vec![
+                    "rebase".to_string(),
+                    "--interactive".to_string(),
+                    "--autosquash".to_string(),
+                    "--autostash".to_string(),
+                ];
+                match git
+                    .run(&["rev-parse", "--verify", &format!("{target}^")])
+                    .await
+                {
+                    Ok(parent) => arguments.push(parent),
+                    Err(_) => arguments.push("--root".to_string()),
+                }
+                run_rebase_command(&git, &arguments).await
             })
             .boxed()
     }
@@ -8001,6 +8039,69 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[gpui::test]
+    async fn test_amend_to_folds_staged_changes_into_an_older_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        commit_file(repo_dir.path(), "base.txt", "base", "base");
+        let first = commit_file(repo_dir.path(), "one.txt", "one", "first");
+        commit_file(repo_dir.path(), "two.txt", "two", "second");
+
+        fs::write(repo_dir.path().join("one.txt"), "one, improved").unwrap();
+        git_command(repo_dir.path(), ["add", "one.txt"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository.amend_to(first.clone()).await.unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3"]),
+            "second\nfirst\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", "HEAD~1:one.txt"]),
+            "one, improved"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["show", "HEAD:one.txt"]),
+            "one, improved"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["status", "--porcelain"]),
+            ""
+        );
+        assert_ne!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD~1"]),
+            first
+        );
+    }
+
+    #[gpui::test]
+    async fn test_amend_to_needs_staged_changes(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let first = commit_file(repo_dir.path(), "one.txt", "one", "first");
+        commit_file(repo_dir.path(), "two.txt", "two", "second");
+        let head = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let error = repository.amend_to(first).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("no staged changes"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
+            head
         );
     }
 }

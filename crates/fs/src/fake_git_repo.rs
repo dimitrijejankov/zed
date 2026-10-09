@@ -1787,6 +1787,10 @@ impl GitRepository for FakeGitRepository {
         async { Ok(None) }.boxed()
     }
 
+    fn amend_to(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+        async { anyhow::bail!("amending is not supported by the fake repository") }.boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

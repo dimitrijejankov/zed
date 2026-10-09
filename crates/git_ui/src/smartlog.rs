@@ -813,6 +813,30 @@ fn short_duration(elapsed: Duration) -> String {
     }
 }
 
+/// A rebase that stopped on conflicts is not a failure: it is waiting for the user, so it is
+/// reported with a toast and the conflict banner instead of an error.
+fn report_rebase_conflicts(
+    workspace: &WeakEntity<Workspace>,
+    result: anyhow::Result<()>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> anyhow::Result<()> {
+    match result {
+        Err(error) if stopped_on_conflicts(&error) => {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<Smartlog>(),
+                        "Rebase stopped on conflicts. Resolve them, then press Continue.",
+                    ),
+                    cx,
+                );
+            })?;
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 fn stopped_on_conflicts(error: &anyhow::Error) -> bool {
     error.to_string().contains("CONFLICT")
 }
@@ -1676,6 +1700,11 @@ impl Smartlog {
             && !self.protected_from_hiding.contains(&sha)
             && !self.hidden_closure.contains(&sha);
         let is_hidden_root = self.hidden.contains(&sha);
+        let can_amend_to = is_draft
+            && !is_head
+            && self.protected_from_hiding.contains(&sha)
+            && !self.selected_paths().is_empty()
+            && !self.rebase_in_progress(cx);
         let trunk = self.trunk.clone();
         let smartlog = cx.entity().downgrade();
         let workspace = self.workspace.clone();
@@ -1706,6 +1735,16 @@ impl Smartlog {
                     }
                 })
                 .separator()
+                .when(can_amend_to, |menu| {
+                    menu.entry("Amend Changes to Here", None, {
+                        let smartlog = smartlog.clone();
+                        move |window, cx| {
+                            smartlog
+                                .update(cx, |this, cx| this.amend_changes_to(sha, window, cx))
+                                .log_err();
+                        }
+                    })
+                })
                 .when_some(rebase_plan, |menu, plan| {
                     menu.entry(format!("Rebase onto {trunk}"), None, {
                         let smartlog = smartlog.clone();
@@ -1989,23 +2028,43 @@ impl Smartlog {
             let result = repository
                 .update(cx, |repository, cx| operation(repository, cx))
                 .await?;
-            match result {
-                Err(error) if stopped_on_conflicts(&error) => {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<Smartlog>(),
-                                "Rebase stopped on conflicts. Resolve them, then press Continue.",
-                            ),
-                            cx,
-                        );
-                    })?;
-                    Ok(())
-                }
-                other => other,
-            }
+            report_rebase_conflicts(&workspace, result, cx)
         });
         self.run_logged(failure_title, task, window, cx);
+    }
+
+    /// Folds the checked uncommitted changes into `sha`, an older commit on the checked-out
+    /// branch, by committing them as a fixup and squashing it into place.
+    fn amend_changes_to(&mut self, sha: Oid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository(cx) else {
+            return;
+        };
+        let selected = self.selected_paths();
+        if selected.is_empty() {
+            return;
+        }
+        let unselected: Vec<RepoPath> = self.deselected.iter().cloned().collect();
+        let workspace = self.workspace.clone();
+
+        let task = cx.spawn_in(window, async move |_, cx| {
+            repository
+                .update(cx, |repository, cx| repository.stage_entries(selected, cx))
+                .await?;
+            if !unselected.is_empty() {
+                repository
+                    .update(cx, |repository, cx| {
+                        repository.unstage_entries(unselected, cx)
+                    })
+                    .await?;
+            }
+            let result = repository
+                .update(cx, |repository, cx| {
+                    repository.amend_to(sha.to_string(), cx)
+                })
+                .await?;
+            report_rebase_conflicts(&workspace, result, cx)
+        });
+        self.run_logged("Failed to amend changes to commit", task, window, cx);
     }
 
     fn rebase_stack(&mut self, plan: RebasePlan, window: &mut Window, cx: &mut Context<Self>) {

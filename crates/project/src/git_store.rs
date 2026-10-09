@@ -1106,6 +1106,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_rebase_continue);
         client.add_entity_request_handler(Self::handle_rebase_abort);
         client.add_entity_request_handler(Self::handle_fold_commits);
+        client.add_entity_request_handler(Self::handle_amend_to);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4281,6 +4282,24 @@ impl GitStore {
             .await??;
 
         Ok(proto::GitCommitBeforeTimeResponse { sha })
+    }
+
+    async fn handle_amend_to(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitAmendTo>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let sha = envelope.payload.sha;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, cx| {
+                repository_handle.amend_to(sha, cx)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
     }
 
     async fn handle_fold_commits(
@@ -9800,6 +9819,38 @@ impl Repository {
                                 new_base,
                                 old_base,
                                 branch,
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        );
+        self.schedule_scan_if_local(cx);
+        receiver
+    }
+
+    /// Folds the staged changes into `sha`, an ancestor of `HEAD`.
+    pub fn amend_to(
+        &mut self,
+        sha: String,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let receiver = self.send_job(
+            "amend_to",
+            Some("git commit --fixup".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.amend_to(sha).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitAmendTo {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                sha,
                             })
                             .await?;
                         Ok(())
