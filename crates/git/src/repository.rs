@@ -57,6 +57,14 @@ static GRAPH_COMMIT_FORMAT: &str = "--format=%H%x00%P%x00%D";
 /// %H - Full commit hash
 static SEARCH_COMMIT_FORMAT: &str = "--format=%H";
 
+/// One commit of an edited stack: the original commits whose changes it combines, in the order
+/// they are applied, and the message it gets instead of the first one's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackStep {
+    pub sources: Vec<String>,
+    pub message: Option<String>,
+}
+
 /// Refs under this prefix mark a commit as hidden in the Smartlog. They keep the commit
 /// reachable without it being a branch, and git decorates the commit with them in the draft log.
 pub const HIDDEN_COMMIT_REF_PREFIX: &str = "refs/smartlog/hidden/";
@@ -1181,6 +1189,16 @@ pub trait GitRepository: Send + Sync {
     /// Folds the staged changes into `sha`, an ancestor of `HEAD`, by committing them as a fixup
     /// and autosquashing it. If the squash conflicts the rebase stays in progress.
     fn amend_to(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+
+    /// Rebuilds the straight chain of commits `base..tip` as `steps`: reordered, with commits left
+    /// out dropped and commits sharing a step folded together. The changes are merged in memory,
+    /// so a conflict fails before anything is changed. Returns the new tip.
+    fn edit_stack(
+        &self,
+        base: String,
+        tip: String,
+        steps: Vec<StackStep>,
+    ) -> BoxFuture<'_, Result<String>>;
 
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>>;
 
@@ -2986,6 +3004,18 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn edit_stack(
+        &self,
+        base: String,
+        tip: String,
+        steps: Vec<StackStep>,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move { edit_stack_with_git(&git, &base, &tip, &steps).await })
+            .boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -4355,6 +4385,142 @@ async fn fold_commits_with_git(git: &GitBinary, shas: &[String], message: &str) 
     Ok(folded)
 }
 
+async fn tree_of(git: &GitBinary, commit: &str) -> Result<String> {
+    git.run(&["rev-parse", &format!("{commit}^{{tree}}")]).await
+}
+
+/// Applies the changes `theirs` made since `merge_base` onto `ours`, without touching the working
+/// tree, and returns the resulting tree. Fails when the changes conflict.
+async fn merge_trees(
+    git: &GitBinary,
+    merge_base: &str,
+    ours: &str,
+    theirs: &str,
+) -> Result<String> {
+    let mut command = git.build_command(&[
+        "merge-tree".to_string(),
+        "--write-tree".to_string(),
+        format!("--merge-base={merge_base}"),
+        ours.to_string(),
+        theirs.to_string(),
+    ]);
+    let output = command.output().await?;
+    match output.status.code() {
+        Some(0) => String::from_utf8(output.stdout)?
+            .lines()
+            .next()
+            .map(|tree| tree.trim().to_string())
+            .filter(|tree| !tree.is_empty())
+            .context("git merge-tree did not return a tree"),
+        Some(1) => anyhow::bail!(
+            "The changes of {} conflict with the commits before them",
+            &theirs[..theirs.len().min(8)]
+        ),
+        _ => anyhow::bail!(
+            "git merge-tree failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
+}
+
+async fn edit_stack_with_git(
+    git: &GitBinary,
+    base: &str,
+    tip: &str,
+    steps: &[StackStep],
+) -> Result<String> {
+    let base = git
+        .run(&["rev-parse", "--verify", &format!("{base}^{{commit}}")])
+        .await?;
+    let tip = git
+        .run(&["rev-parse", "--verify", &format!("{tip}^{{commit}}")])
+        .await?;
+
+    let listing = git
+        .run(&[
+            "rev-list",
+            "--reverse",
+            "--topo-order",
+            "--parents",
+            &format!("{base}..{tip}"),
+        ])
+        .await?;
+    let mut chain: Vec<String> = Vec::new();
+    let mut previous = base.clone();
+    for line in listing.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(commit) = fields.next() else {
+            continue;
+        };
+        let parents: Vec<&str> = fields.collect();
+        anyhow::ensure!(
+            parents == [previous.as_str()],
+            "The commits aren't a single straight line, so the stack can't be edited"
+        );
+        chain.push(commit.to_string());
+        previous = commit.to_string();
+    }
+    anyhow::ensure!(!chain.is_empty(), "There are no commits to edit");
+
+    let mut used: HashSet<&str> = HashSet::default();
+    for source in steps.iter().flat_map(|step| step.sources.iter()) {
+        anyhow::ensure!(
+            chain.iter().any(|commit| commit == source),
+            "{source} isn't part of the stack"
+        );
+        anyhow::ensure!(used.insert(source.as_str()), "{source} is used twice");
+    }
+    for step in steps {
+        anyhow::ensure!(!step.sources.is_empty(), "A step needs at least one commit");
+    }
+
+    let mut new_tip = base.clone();
+    let mut step_commit_of: HashMap<String, String> = HashMap::default();
+    for step in steps {
+        let mut cursor = new_tip.clone();
+        let mut tree = tree_of(git, &cursor).await?;
+        for source in &step.sources {
+            let source_parent = git.run(&["rev-parse", &format!("{source}^")]).await?;
+            tree = merge_trees(git, &source_parent, &cursor, source).await?;
+            cursor = commit_tree_like(git, source, &tree, &[cursor.as_str()], None).await?;
+        }
+        let Some(first) = step.sources.first() else {
+            continue;
+        };
+        let new_commit = commit_tree_like(
+            git,
+            first,
+            &tree,
+            &[new_tip.as_str()],
+            step.message.as_deref(),
+        )
+        .await?;
+        for source in &step.sources {
+            step_commit_of.insert(source.clone(), new_commit.clone());
+        }
+        new_tip = new_commit;
+    }
+
+    let mut rewritten: HashMap<String, String> = HashMap::default();
+    let mut latest = base.clone();
+    for commit in &chain {
+        if let Some(step_commit) = step_commit_of.get(commit) {
+            latest = step_commit.clone();
+        }
+        rewritten.insert(commit.clone(), latest.clone());
+    }
+    rewritten.insert(tip.clone(), new_tip.clone());
+
+    replay_descendants(
+        git,
+        &tip,
+        rewritten,
+        "No local branch or detached HEAD contains this stack, so it can't be edited",
+    )
+    .await?;
+    Ok(new_tip)
+}
+
 /// Recreates every commit built on `root` on top of its rewritten ancestors, then moves the
 /// local branches and a detached `HEAD` that pointed at any rewritten commit.
 async fn replay_descendants(
@@ -4383,7 +4549,26 @@ async fn replay_descendants(
             continue;
         };
         let parents: Vec<&str> = fields.collect();
-        let new_commit = recreate_commit(git, commit, &parents, &rewritten, None, None).await?;
+        let rebuilt_tree = match parents.as_slice() {
+            [old_parent] => match rewritten.get(*old_parent) {
+                Some(new_parent)
+                    if tree_of(git, new_parent).await? != tree_of(git, old_parent).await? =>
+                {
+                    Some(merge_trees(git, old_parent, new_parent, commit).await?)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let new_commit = recreate_commit(
+            git,
+            commit,
+            &parents,
+            &rewritten,
+            None,
+            rebuilt_tree.as_deref(),
+        )
+        .await?;
         rewritten.insert(commit.to_string(), new_commit);
     }
 
@@ -4436,7 +4621,7 @@ async fn replay_descendants(
 
 /// Creates a copy of `commit` with the same author and committer, whose parents are the
 /// `parents` mapped through `rewritten`. The tree is `commit`'s unless `tree_from` names another
-/// commit, and the message is kept unless `message` is given.
+/// commit or tree, and the message is kept unless `message` is given.
 async fn recreate_commit(
     git: &GitBinary,
     commit: &str,
@@ -4445,12 +4630,29 @@ async fn recreate_commit(
     message: Option<&str>,
     tree_from: Option<&str>,
 ) -> Result<String> {
+    let tree = tree_of(git, tree_from.unwrap_or(commit)).await?;
+    let parents: Vec<&str> = parents
+        .iter()
+        .map(|parent| rewritten.get(*parent).map_or(*parent, String::as_str))
+        .collect();
+    commit_tree_like(git, commit, &tree, &parents, message).await
+}
+
+/// Creates a commit with `tree` and `parents` that has the author, committer and, unless
+/// `message` is given, the message of `metadata_from`.
+async fn commit_tree_like(
+    git: &GitBinary,
+    metadata_from: &str,
+    tree: &str,
+    parents: &[&str],
+    message: Option<&str>,
+) -> Result<String> {
     let metadata = git
         .run(&[
             "show",
             "-s",
             "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B",
-            commit,
+            metadata_from,
         ])
         .await?;
     let mut fields = metadata.splitn(7, '\0');
@@ -4472,26 +4674,14 @@ async fn recreate_commit(
         fields.next(),
     )
     else {
-        anyhow::bail!("Could not read the metadata of commit {commit}");
+        anyhow::bail!("Could not read the metadata of commit {metadata_from}");
     };
-
-    let tree = git
-        .run(&[
-            "rev-parse",
-            &format!("{}^{{tree}}", tree_from.unwrap_or(commit)),
-        ])
-        .await?;
     let message = message.unwrap_or(original_message).trim_end_matches('\n');
 
-    let mut arguments: Vec<String> = vec!["commit-tree".into(), tree];
+    let mut arguments: Vec<String> = vec!["commit-tree".into(), tree.to_string()];
     for parent in parents {
         arguments.push("-p".into());
-        arguments.push(
-            rewritten
-                .get(*parent)
-                .cloned()
-                .unwrap_or_else(|| parent.to_string()),
-        );
+        arguments.push(parent.to_string());
     }
     arguments.push("-m".into());
     arguments.push(message.to_string());
@@ -8102,6 +8292,186 @@ mod tests {
         assert_eq!(
             git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
             head
+        );
+    }
+
+    fn stack_step(sources: &[&str], message: Option<&str>) -> StackStep {
+        StackStep {
+            sources: sources.iter().map(|source| source.to_string()).collect(),
+            message: message.map(str::to_string),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_edit_stack_reorders_commits_and_moves_branches(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "base.txt", "base", "base");
+        let first = commit_file(repo_dir.path(), "a.txt", "a", "add a");
+        let second = commit_file(repo_dir.path(), "b.txt", "b", "add b");
+        git_command(repo_dir.path(), ["branch", "on-first", &first]);
+        fs::write(repo_dir.path().join("untracked.txt"), "keep").unwrap();
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let new_tip = repository
+            .edit_stack(
+                base,
+                second.clone(),
+                vec![stack_step(&[&second], None), stack_step(&[&first], None)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            new_tip
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3"]),
+            "add a\nadd b\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "main"]),
+            "a.txt\nb.txt\nbase.txt"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "on-first"]),
+            new_tip
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["status", "--porcelain"]),
+            "?? untracked.txt"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_edit_stack_drops_a_commit_and_reapplies_what_is_built_on_it(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "base.txt", "base", "base");
+        let first = commit_file(repo_dir.path(), "a.txt", "a", "add a");
+        let second = commit_file(repo_dir.path(), "b.txt", "b", "add b");
+        commit_file(repo_dir.path(), "c.txt", "c", "add c on top");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .edit_stack(base, second, vec![stack_step(&[&first], None)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-3"]),
+            "add c on top\nadd a\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "main"]),
+            "a.txt\nbase.txt\nc.txt"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_edit_stack_folds_commits_with_a_new_message(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "base.txt", "base", "base");
+        let first = commit_file(repo_dir.path(), "a.txt", "a", "add a");
+        let second = commit_file(repo_dir.path(), "b.txt", "b", "add b");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        repository
+            .edit_stack(
+                base,
+                second.clone(),
+                vec![stack_step(&[&first, &second], Some("add a and b"))],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["log", "--format=%s", "-2"]),
+            "add a and b\nbase"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["ls-tree", "--name-only", "main"]),
+            "a.txt\nb.txt\nbase.txt"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_edit_stack_changes_nothing_when_the_new_order_conflicts(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "f.txt", "line", "base");
+        let first = commit_file(repo_dir.path(), "f.txt", "first change", "first");
+        let second = commit_file(repo_dir.path(), "f.txt", "second change", "second");
+        let before = git_command_output(repo_dir.path(), ["rev-parse", "main"]);
+
+        let repository = open_repository(repo_dir.path(), cx);
+        let error = repository
+            .edit_stack(
+                base,
+                second.clone(),
+                vec![stack_step(&[&second], None), stack_step(&[&first], None)],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("conflict"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "main"]),
+            before
+        );
+    }
+
+    #[gpui::test]
+    async fn test_edit_stack_rejects_commits_outside_the_stack_and_duplicates(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let base = commit_file(repo_dir.path(), "base.txt", "base", "base");
+        let first = commit_file(repo_dir.path(), "a.txt", "a", "add a");
+
+        let repository = open_repository(repo_dir.path(), cx);
+        assert!(
+            repository
+                .edit_stack(
+                    base.clone(),
+                    first.clone(),
+                    vec![stack_step(&[&base], None)]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .edit_stack(
+                    base,
+                    first.clone(),
+                    vec![stack_step(&[&first], None), stack_step(&[&first], None)]
+                )
+                .await
+                .is_err()
         );
     }
 }

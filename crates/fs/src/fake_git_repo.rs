@@ -1791,6 +1791,15 @@ impl GitRepository for FakeGitRepository {
         async { anyhow::bail!("amending is not supported by the fake repository") }.boxed()
     }
 
+    fn edit_stack(
+        &self,
+        _base: String,
+        _tip: String,
+        _steps: Vec<git::repository::StackStep>,
+    ) -> BoxFuture<'_, Result<String>> {
+        async { anyhow::bail!("editing stacks is not supported by the fake repository") }.boxed()
+    }
+
     fn rebase_continue(&self) -> BoxFuture<'_, Result<()>> {
         async { anyhow::bail!("rebasing is not supported by the fake repository") }.boxed()
     }

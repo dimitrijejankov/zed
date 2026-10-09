@@ -533,7 +533,8 @@ message Envelope {
     GitFoldCommits git_fold_commits = 501;
     GitCommitBeforeTime git_commit_before_time = 502;
     GitCommitBeforeTimeResponse git_commit_before_time_response = 503;
-    GitAmendTo git_amend_to = 504; // current max
+    GitAmendTo git_amend_to = 504;
+    GitEditStack git_edit_stack = 505; // current max
   }
 
   reserved 87 to 88;

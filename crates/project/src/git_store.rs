@@ -42,8 +42,8 @@ use git::{
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
         GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, HIDDEN_COMMIT_REF_PREFIX,
         InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
-        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
-        delete_branch_flag, is_binary_content,
+        RepoPath, ResetMode, SearchCommitArgs, StackStep, UpstreamTrackingStatus,
+        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -1107,6 +1107,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_rebase_abort);
         client.add_entity_request_handler(Self::handle_fold_commits);
         client.add_entity_request_handler(Self::handle_amend_to);
+        client.add_entity_request_handler(Self::handle_edit_stack);
         client.add_entity_request_handler(Self::handle_commit_before_time);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4282,6 +4283,32 @@ impl GitStore {
             .await??;
 
         Ok(proto::GitCommitBeforeTimeResponse { sha })
+    }
+
+    async fn handle_edit_stack(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitEditStack>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitRewordCommitResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let payload = envelope.payload;
+        let steps = payload
+            .steps
+            .into_iter()
+            .map(|step| StackStep {
+                sources: step.sources,
+                message: step.message,
+            })
+            .collect();
+
+        let sha = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.edit_stack(payload.base, payload.tip, steps)
+            })
+            .await??;
+
+        Ok(proto::GitRewordCommitResponse { sha })
     }
 
     async fn handle_amend_to(
@@ -9828,6 +9855,45 @@ impl Repository {
         );
         self.schedule_scan_if_local(cx);
         receiver
+    }
+
+    /// Rebuilds the straight chain of commits `base..tip` as `steps`.
+    pub fn edit_stack(
+        &mut self,
+        base: String,
+        tip: String,
+        steps: Vec<StackStep>,
+    ) -> oneshot::Receiver<Result<String>> {
+        let id = self.id;
+        self.send_job(
+            "edit_stack",
+            Some("git merge-tree".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.edit_stack(base, tip, steps).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        let response = client
+                            .request(proto::GitEditStack {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                base,
+                                tip,
+                                steps: steps
+                                    .into_iter()
+                                    .map(|step| proto::GitStackStep {
+                                        sources: step.sources,
+                                        message: step.message,
+                                    })
+                                    .collect(),
+                            })
+                            .await?;
+                        Ok(response.sha)
+                    }
+                }
+            },
+        )
     }
 
     /// Folds the staged changes into `sha`, an ancestor of `HEAD`.
