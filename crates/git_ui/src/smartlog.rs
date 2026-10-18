@@ -113,7 +113,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-pub(crate) fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
         return;
     };
@@ -2504,17 +2504,22 @@ impl Smartlog {
     /// A branch label, with the trunk marked so it is clear which branch everything is measured
     /// against.
     fn branch_chip(&self, name: String, cx: &App) -> Chip {
-        let is_trunk = name == self.trunk.as_ref();
-        let chip = Chip::new(name).label_size(LabelSize::Small);
-        if is_trunk {
-            chip.icon(IconName::GitBranch)
-                .icon_color(Color::Info)
-                .label_color(Color::Info)
-                .bg_color(cx.theme().status().info_background)
-                .border_color(cx.theme().status().info_border)
+        if name == self.trunk.as_ref() {
+            Self::trunk_chip(name, cx)
         } else {
-            chip
+            Chip::new(name).label_size(LabelSize::Small)
         }
+    }
+
+    /// The label for the trunk, in the info color. It keeps the default chip background because
+    /// the theme's info background is as bright as the label.
+    fn trunk_chip(label: String, cx: &App) -> Chip {
+        Chip::new(label)
+            .label_size(LabelSize::Small)
+            .label_color(Color::Info)
+            .icon(IconName::GitBranch)
+            .icon_color(Color::Info)
+            .border_color(cx.theme().status().info_border)
     }
 
     fn local_branches_at(&self, sha: Oid, cx: &App) -> Vec<String> {
@@ -4526,13 +4531,7 @@ impl Render for Smartlog {
                 div()
                     .id("smartlog-trunk")
                     .child(
-                        Chip::new(format!("Trunk: {}", self.trunk))
-                            .label_size(LabelSize::Small)
-                            .icon(IconName::GitBranch)
-                            .icon_color(Color::Info)
-                            .label_color(Color::Info)
-                            .bg_color(cx.theme().status().info_background)
-                            .border_color(cx.theme().status().info_border),
+                        Self::trunk_chip(format!("Trunk: {}", self.trunk), cx),
                     )
                     .tooltip(Tooltip::text(
                         "Everything not on this branch is shown as a draft. Right-click a commit and choose Set Trunk to change it.",

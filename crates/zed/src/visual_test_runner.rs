@@ -248,7 +248,11 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     cx.run_until_parked();
 
     // Open workspace window
-    let window_size = size(px(1280.0), px(800.0));
+    let window_height = std::env::var("VISUAL_TEST_HEIGHT")
+        .ok()
+        .and_then(|height| height.parse::<f32>().ok())
+        .unwrap_or(800.0);
+    let window_size = size(px(1280.0), px(window_height));
     let bounds = Bounds {
         origin: point(px(0.0), px(0.0)),
         size: window_size,
@@ -311,6 +315,10 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     worktree_result.context("Failed to add worktree")?;
 
     cx.run_until_parked();
+
+    if let Ok(repository_path) = std::env::var("SMARTLOG_REPO") {
+        return run_smartlog_visual_test(&mut cx, workspace_window, PathBuf::from(repository_path));
+    }
 
     // Create and add the project panel
     let (weak_workspace, async_window_cx) = workspace_window
@@ -960,6 +968,59 @@ cargo run
 ```
 "#;
     std::fs::write(project_path.join("README.md"), readme).expect("Failed to write README.md");
+}
+
+/// Opens the Smartlog of the repository at `repository_path` and saves a screenshot of the window
+/// to `smartlog.png` in the output directory.
+#[cfg(target_os = "macos")]
+fn run_smartlog_visual_test(
+    cx: &mut VisualTestAppContext,
+    workspace_window: WindowHandle<Workspace>,
+    repository_path: PathBuf,
+) -> Result<()> {
+    let add_worktree = workspace_window
+        .update(cx, |workspace, _window, cx| {
+            workspace.project().update(cx, |project, cx| {
+                project.find_or_create_worktree(&repository_path, true, cx)
+            })
+        })
+        .context("Failed to start adding the repository")?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree)
+        .context("Failed to add the repository")?;
+    let git_scans = workspace_window
+        .update(cx, |workspace, _window, cx| {
+            workspace
+                .project()
+                .update(cx, |project, cx| project.git_scans_complete(cx))
+        })
+        .context("Failed to wait for the git scan")?;
+    cx.foreground_executor.block_test(git_scans);
+    cx.run_until_parked();
+
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            git_ui::smartlog::open(workspace, window, cx)
+        })
+        .context("Failed to open the Smartlog")?;
+
+    for _ in 0..100 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cx.background_executor.forbid_parking();
+
+    cx.update_window(workspace_window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+    let screenshot = cx.capture_screenshot(workspace_window.into())?;
+    let output_dir = std::env::var("VISUAL_TEST_OUTPUT_DIR")
+        .unwrap_or_else(|_| "target/visual_tests".to_string());
+    std::fs::create_dir_all(&output_dir)?;
+    let output_path = PathBuf::from(&output_dir).join("smartlog.png");
+    screenshot.save(&output_path)?;
+    println!("Smartlog screenshot saved to: {}", output_path.display());
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
